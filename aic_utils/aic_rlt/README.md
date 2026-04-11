@@ -5,6 +5,87 @@ Implementation of **"RL Token: Bootstrapping Online RL with Vision-Language-Acti
 
 ---
 
+## Usage
+
+### 1. Install
+
+```bash
+cd aic_utils/aic_rlt
+pip install -e .
+```
+
+### 2. Implement the VLA stub
+
+In `scripts/train.py`, replace `load_vla()` with your actual VLA (π0, ACT, etc.).
+The VLA object must expose:
+
+```python
+vla.get_embeddings(obs) -> torch.Tensor  # (1, N, D_vla) internal embeddings
+vla.get_action_chunk(obs) -> np.ndarray  # (C, D) reference action chunk
+```
+
+For ACT (the AIC baseline), add forward hooks on the transformer layers to capture
+intermediate embeddings and update `RLTokenConfig.vla_embed_dim` / `num_vla_tokens`
+to match.
+
+### 3. Phase 1 — Pretrain RL Token
+
+Requires: demonstration trajectories as `.pt` files, each containing
+`{"vla_embeddings": torch.Tensor(N, D_vla)}` extracted by running the VLA on recorded
+episodes.
+
+```bash
+python scripts/train.py \
+    --mode pretrain_rl_token \
+    --demo_dir /path/to/demo/embeddings \
+    --checkpoint_dir checkpoints/rlt \
+    --vla_model_path /path/to/vla
+```
+
+### 4a. Phase 2 — Offline RL (trajectory data only)
+
+Requires: trajectory data with reward labels. Increase `--bc_coeff` to 2.0–5.0 to
+compensate for the lack of online coverage.
+
+```bash
+python scripts/train.py \
+    --mode offline_rl \
+    --load_checkpoint checkpoints/rlt/phase1_rl_token.pt \
+    --trajectory_dir /path/to/trajectories \
+    --checkpoint_dir checkpoints/rlt \
+    --bc_coeff 3.0 \
+    --total_gradient_steps 50000
+```
+
+### 4b. Phase 2 — Online RL (live robot or simulator)
+
+Requires: real-time environment interaction. Replace `AICEnvWrapper` in `train.py` with
+real environment calls (MuJoCo, Gazebo, or the live robot via the AIC ROS 2 interface).
+
+```bash
+python scripts/train.py \
+    --mode online_rl \
+    --load_checkpoint checkpoints/rlt/phase1_rl_token.pt \
+    --checkpoint_dir checkpoints/rlt \
+    --n_warmup_steps 2000 \
+    --total_env_steps 50000 \
+    --bc_coeff 1.0
+```
+
+### 5. Inference (AIC ROS 2 framework)
+
+```bash
+pixi run ros2 run aic_model aic_model \
+    --ros-args \
+    -p use_sim_time:=true \
+    -p policy:=aic_example_policies.ros.RunRLT \
+    -p policy_args.checkpoint_path:=/path/to/checkpoints/rlt/final.pt
+```
+
+Fill in `RunRLT._load_vla()` with the same VLA loader used during training.
+
+---
+
 ## Overview
 
 RLT is a lightweight method for fine-tuning a pretrained Vision-Language-Action (VLA) model
@@ -261,6 +342,235 @@ VLA embeddings (N=540, D=7848)  — frozen, stop-gradient
 
 ---
 
+## Actor and Critic MLPs
+
+### Actor
+
+The actor implements a Gaussian policy `π_θ(a_{1:C} | x, ā_{1:C})` that outputs an action
+chunk — a sequence of `C=10` actions at once.
+
+**Input** — three tensors concatenated into one flat vector:
+
+```
+[ z_rl (2048) | prop (26) | ref_action_chunk (C×D = 70) ]
+  └─ RL token   └─ joint pos, TCP pose/vel/err   └─ VLA's suggested actions
+```
+
+**Trunk MLP** — maps the concatenated input to `C×D = 70` output values (the mean `μ`):
+
+```
+Linear → LayerNorm → SiLU  →  ...repeat...  →  Linear
+                                                    │
+                                             reshape to (B, C, D) = μ
+```
+
+Default: 2 hidden layers of 256 units. For harder tasks (e.g. screw insertion), use
+`[512, 512, 512]`.
+
+**Log std** — a single learned parameter vector of size `C×D`, shared across all inputs
+(state-independent). It is not predicted from the observation:
+
+```python
+self.log_std = nn.Parameter(torch.zeros(C * D))   # initialized to 0 → std = 1.0
+log_std = self.log_std.clamp(-5.0, 2.0)           # std range: [0.007, 7.4]
+```
+
+Initialized to 0 (std = 1.0) for broad early exploration. Learned via gradient descent
+alongside the rest of the actor — shrinks as the policy becomes more confident.
+
+**Reference action dropout** — at training time, 50% of samples have their VLA reference
+chunk zeroed out:
+
+```python
+mask = torch.bernoulli(torch.full((B, 1), 0.5, ...))
+ref_flat = ref_flat * mask
+```
+
+This prevents the actor from blindly copying the VLA. Without it, the actor learns to
+rely on the reference signal and fails when it is unavailable (e.g. at test-time if the
+VLA is unavailable, or at the next state during critic target computation).
+
+**Sampling vs. deterministic output:**
+- `sample()` — used during training; draws `action ~ N(μ, σ²)` via `rsample()`
+  (reparameterization trick so gradients flow back through the sample)
+- `get_mean()` — used at inference; returns `μ` directly, no stochasticity
+
+**Note:** `sample()` also returns `log_prob`, but it is always discarded (`_`). This is
+not a policy gradient algorithm — gradients flow through the reparameterized sample
+into the Q-loss and BC-loss directly.
+
+---
+
+### Critic (Twin Q-network)
+
+The critic estimates `Q(x, a_{1:C})` — the expected return for taking a chunk of actions
+from a given state. It uses a **TD3-style twin ensemble** of two independent Q-networks
+to reduce overestimation bias.
+
+**Input** — same state, plus the action chunk:
+
+```
+[ z_rl (2048) | prop (26) | action_chunk (C×D = 70) ]  →  scalar Q-value
+```
+
+Each Q-network has the same MLP architecture as the actor trunk. The two networks have
+independent weights and are trained separately.
+
+**`min_q()`** returns `min(Q1, Q2)` — the pessimistic estimate. This is used in:
+- **Actor updates**: to avoid exploiting overestimated Q-values
+- **Critic target computation**: to prevent value overestimation from propagating
+
+**Target critic** — a frozen copy of the critic updated via EMA (τ = 0.005) after every
+critic gradient step. Used only for computing TD targets; never directly trained.
+
+---
+
+## Actor-Critic: Key Values Reference
+
+### Networks (persistent, have weights)
+
+| Name | What it is | How weights update |
+|---|---|---|
+| `actor` | The policy. Takes `(z_rl, prop, ref_action)` → outputs action chunk | Adam optimizer, via actor loss |
+| `critic` | Twin Q-networks (Q1, Q2). Takes `(z_rl, prop, action)` → scalar Q-value | Adam optimizer, via critic loss |
+| `critic_target` | Frozen lagged copy of `critic`. Same architecture, different weights | EMA only: `θ' ← (1-τ)θ' + τθ` |
+
+### Values computed per update step (not stored, recomputed each batch)
+
+| Name | What it is | Where it comes from |
+|---|---|---|
+| `q_target` | The TD learning label — what Q "should" equal | `reward + γ^C * critic_target.min_q(next_state, next_action)` |
+| `Q1, Q2` | Current Q estimates for the batch | `critic.forward(state, action)` |
+| `q_val` | Pessimistic Q used in actor loss | `critic.min_q(state, actor_action)` |
+
+### Relationships
+
+```
+actor ──sample──► action_chunk ──► env ──► reward, next_obs
+  │                                               │
+  │                                         replay buffer
+  │                                               │
+  │◄──────────────── actor loss ◄─── q_val (min of Q1,Q2 on actor's action)
+  │                                    + BC loss vs ref_action
+  │
+critic (Q1, Q2) ──► critic loss = MSE(Q1, q_target) + MSE(Q2, q_target)
+                                              ▲
+                              q_target (computed with no_grad)
+                                = reward + γ^C * critic_target.min_q(next_state, ...)
+                                                         ▲
+                                                  critic_target
+                                               (EMA copy of critic,
+                                                never gradient-trained)
+```
+
+### One-line rules to keep them straight
+
+- **`critic`** — the one being trained
+- **`critic_target`** — the one used for stable labels, trails behind `critic`
+- **`q_target`** — a number (tensor of scalars), not a network; the regression target for the critic loss
+- **`q_val`** — a number used to push the actor toward higher-value actions
+
+---
+
+## Training Process
+
+### Phase 1: RL Token Pretraining
+
+Before any RL, the RL token encoder-decoder is trained on demonstration data:
+
+1. Feed demo VLA embeddings through the encoder → `z_rl`
+2. Decoder reconstructs the original embeddings from `z_rl` (MSE loss, equation 2)
+3. Once done, **freeze** the RL token model — it is never updated again
+
+### Phase 2: Online RL
+
+The main loop alternates between rollout and gradient updates at a 1:5 ratio:
+
+```
+while env_step_count < total_env_steps:
+    collect_transition(...)        # 1 environment step
+    for _ in range(5):             # updates_per_step = 5
+        gradient_update_step()     # 2 critic updates + 1 actor update
+```
+
+#### Rollout — `_collect_transition`
+
+Three possible sources for the action chunk, in priority order:
+
+| Condition | Action source |
+|---|---|
+| Human intervenes | Human-provided chunk |
+| `step < 2000` (warmup) | VLA reference directly |
+| Otherwise | `actor.sample(...)` |
+
+After executing the chunk, a `Transition` `(z_rl, prop, action_chunk, ref_chunk, reward,
+next_z_rl, next_prop, done)` is stored in the replay buffer.
+
+#### Gradient Update — `_gradient_update_step`
+
+Each update round performs **2 critic updates then 1 actor update**:
+
+**Critic update** (equation 3) — minimize Bellman error:
+
+```python
+# TD3 target: actor mean + clipped noise, evaluated by frozen target critic
+next_action = actor(next_state, ref=zeros) + clipped_noise
+q_target = reward + γ^C * (1 - done) * critic_target.min_q(next_state, next_action)
+
+# Minimize MSE for both Q-networks
+critic_loss = MSE(Q1, q_target) + MSE(Q2, q_target)
+```
+
+After each critic update, the **target critic** is soft-updated: `θ' ← (1-τ)θ' + τθ`.
+
+**Actor update** (equation 5) — maximize Q while staying close to the VLA:
+
+```python
+action = actor.sample(state, ref_action)         # reparameterized sample
+actor_loss = -critic.min_q(state, action).mean() # maximize Q
+           + β * MSE(action, ref_action)          # BC regularizer toward VLA
+```
+
+#### Data flow
+
+```
+obs
+ ├─ VLA embeddings ──► RLTokenEncoder (frozen) ──► z_rl ─┐
+ └─ proprioception ──────────────────────────────► prop  ─┴─► state x
+                                                              │
+                                                    ┌─────────┤
+                                                    ▼         ▼
+                                                  Actor     Critic
+                                                    │         │
+                                             action chunk   Q-value
+                                                    │
+                                               env_step
+                                                    │
+                                            reward, next_obs
+                                                    │
+                                            replay_buffer
+                                                    │
+                                        ┌───────────┴──────────┐
+                                   critic update          actor update
+                                  (TD Bellman loss)   (max Q + BC loss)
+```
+
+#### Key design choices
+
+- **`γ^C` discount**: the critic targets a full chunk of `C=10` steps, so the bootstrap
+  is discounted by `C` steps rather than 1.
+- **No ref action at next state**: during critic target computation `ref=zeros` is passed,
+  forcing the actor to handle the no-reference case — which is why ref action dropout
+  during rollout is essential training for this scenario.
+- **log_prob discarded**: despite using `sample()`, this is not a policy gradient method.
+  Gradients flow back through `rsample()` (reparameterization trick) directly into the
+  actor weights via the Q-loss. log_std is therefore trained only through Q-loss and
+  BC-loss, not through an explicit entropy objective.
+- **2 critic updates per 1 actor update**: standard TD3 practice — keeps the critic more
+  accurate than the actor so Q-values are reliable before the actor chases them.
+
+---
+
 ## File Structure
 
 ```
@@ -330,69 +640,79 @@ of training samples so the actor does not become over-reliant on the reference s
 
 ---
 
-## Usage
+## Training with Offline Trajectory Data
 
-### 1. Install
+The original RLT paper trains the actor-critic online against a live robot. If you only
+have pre-collected trajectory data (no real-time robot access), the three phases below
+cover what is and isn't achievable.
 
-```bash
-cd aic_utils/aic_rlt
-pip install -e .
-```
+### What offline trajectories provide
 
-### 2. Implement the VLA stub
+| Available | Needed for |
+|---|---|
+| `(obs, action_chunk, next_obs)` tuples | Phase 1 (RL token), actor BC training |
+| VLA embeddings per timestep | Phase 1 |
+| Reward labels (success/failure) | Phase 2 offline RL (optional but recommended) |
+| Real-time robot interaction | Phase 2 online RL (not available offline) |
 
-In `scripts/train.py`, replace `load_vla()` with your actual VLA (π0, ACT, etc.).
-The VLA object must expose:
+### Option A — Phase 1 only (no rewards needed)
+
+Train the RL token encoder, then fine-tune the actor with BC loss only. This improves
+the actor's ability to track the VLA reference but cannot exceed the VLA's own capability.
+No critic or reward signal is needed.
 
 ```python
-vla.get_embeddings(obs) -> torch.Tensor  # (1, N, D_vla) internal embeddings
-vla.get_action_chunk(obs) -> np.ndarray  # (C, D) reference action chunk
+# Actor loss: BC only, drop Q-maximization
+actor_loss = β * F.mse_loss(action, ref_action)
 ```
 
-For ACT (the AIC baseline), add forward hooks on the transformer layers to capture
-intermediate embeddings and update `RLTokenConfig.vla_embed_dim` / `num_vla_tokens`
-to match.
+Use this when you have no reward labels and want a stable fine-tuned policy.
 
-### 3. Phase 1 — Pretrain RL Token
+### Option B — Offline RL (rewards required)
 
-```bash
-python scripts/train.py \
-    --mode pretrain_rl_token \
-    --demo_dir /path/to/demo/embeddings \
-    --checkpoint_dir checkpoints/rlt \
-    --vla_model_path /path/to/vla
+Pre-populate the replay buffer with your trajectory data and run the standard TD3 updates
+without any online rollouts. The architecture supports this directly — omit
+`_collect_transition` and load transitions from disk instead.
+
+The main risk is **Q overestimation**: the critic will assign high values to
+out-of-distribution actions it has never seen. The BC regularizer (`β * MSE`) acts as a
+conservative constraint that keeps the actor close to the data distribution. Increase `β`
+(e.g. 2.0–5.0) relative to the online setting to compensate.
+
+```python
+# Pre-populate replay buffer from trajectory files
+for traj in offline_trajectories:
+    for t in range(len(traj)):
+        replay_buffer.add(Transition(
+            z_rl=traj[t].z_rl,
+            prop=traj[t].prop,
+            action_chunk=traj[t].action_chunk,
+            ref_action_chunk=traj[t].ref_action_chunk,
+            reward=traj[t].reward,          # binary success or dense reward
+            next_z_rl=traj[t+1].z_rl,
+            next_prop=traj[t+1].prop,
+            done=traj[t].done,
+        ))
+
+# Then run gradient updates directly (no rollout loop)
+for _ in range(total_gradient_steps):
+    trainer._gradient_update_step()
 ```
 
-Demonstration embeddings are `.pt` files, each containing
-`{"vla_embeddings": torch.Tensor(N, D_vla)}` extracted by running the VLA on
-recorded demonstration episodes.
+### Option C — Offline pre-training → online fine-tuning
 
-### 4. Phase 2 — Online RL
+Use trajectory data for Phase 1 and offline actor/critic initialization (Option B), then
+continue with online RL when robot access becomes available. The offline-trained critic
+provides a better starting point, reducing the online interaction needed to converge.
 
-```bash
-python scripts/train.py \
-    --mode online_rl \
-    --load_checkpoint checkpoints/rlt/phase1_rl_token.pt \
-    --checkpoint_dir checkpoints/rlt \
-    --n_warmup_steps 2000 \
-    --total_env_steps 50000 \
-    --bc_coeff 1.0
-```
+### Comparison
 
-Replace `AICEnvWrapper` in `train.py` with real environment calls (MuJoCo, Gazebo,
-or the live robot via the AIC ROS 2 interface).
-
-### 5. Inference (AIC ROS 2 framework)
-
-```bash
-pixi run ros2 run aic_model aic_model \
-    --ros-args \
-    -p use_sim_time:=true \
-    -p policy:=aic_example_policies.ros.RunRLT \
-    -p policy_args.checkpoint_path:=/path/to/checkpoints/rlt/final.pt
-```
-
-Fill in `RunRLT._load_vla()` with the same VLA loader used during training.
+| Mode | Rewards needed | Robot needed | Exceeds VLA baseline |
+|---|---|---|---|
+| Phase 1 + BC only | No | No | Marginally |
+| Offline RL | Yes | No | Partially (limited by data coverage) |
+| Offline pre-train → online fine-tune | Yes | Eventually | Yes |
+| Full online RL (paper) | Yes | Yes | Yes (best) |
 
 ---
 
