@@ -9,7 +9,6 @@ preview = ["pixi-build"]
 
 [target.linux-64.dependencies]
 evdev = ">=1.9.2,<2"
-opencv = "<4.13.0"                                                                     # ROS policy image processing (linux only)
 
 [dependencies]
 isort = "==5.13.2"                                                                     # version bundled by the vscode extension
@@ -37,6 +36,7 @@ setuptools = ">=71.0.0,<81.0.0"                                                 
 
 [pypi-dependencies]
 huggingface-hub = { version = "==0.35.3", extras = ["hf-transfer", "cli"] }
+opencv-python = ">=4.5"                                                                # replaces conda opencv; no libprotobuf conflict
 lerobot = "==0.4.3"
 lerobot_robot_ros = { git = "https://github.com/koonpeng/lerobot-ros", rev = "b4a635fc5264266bd1575f07d54be3d4bbd620e0", subdirectory = "lerobot_robot_ros" }
 lerobot_teleoperator_devices = { git = "https://github.com/koonpeng/lerobot-ros", rev = "b4a635fc5264266bd1575f07d54be3d4bbd620e0", subdirectory = "lerobot_teleoperator_devices" }
