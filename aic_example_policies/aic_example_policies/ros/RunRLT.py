@@ -19,39 +19,47 @@
 Implements "RL Token: Bootstrapping Online RL with Vision-Language-Action Models"
 (Xu et al., Physical Intelligence, 2025).
 
+Supports two VLA backends via policy_args.vla_backend:
+  "xvla"  — lerobot/xvla-base (Florence-2, PyTorch, default)
+  "pi05"  — openpi pi0.5 (PaliGemma, JAX)
+
 At inference time this policy:
   1. Runs the frozen VLA backbone to extract internal embeddings
   2. Encodes them into the RL token z_rl with the frozen encoder
   3. Concatenates z_rl with proprioceptive state → RL state x
   4. Feeds x + VLA reference action chunk into the trained actor to get
      a refined action chunk ā_{1:C}
-  5. Executes actions from the chunk at 50 Hz
+  5. Executes actions from the chunk at the backend's control rate
 
 Load a trained checkpoint produced by aic_rlt/scripts/train.py.
 
-Usage (ROS 2):
+Usage (ROS 2) — XVLA backend (default):
     pixi run ros2 run aic_model aic_model \
         --ros-args \
         -p use_sim_time:=true \
         -p policy:=aic_example_policies.ros.RunRLT \
         -p policy_args.checkpoint_path:=/path/to/checkpoints/rlt/phase2_offline.pt \
         -p policy_args.vla_model_dir:=/home/yifeng/models/xvla-base \
-        -p policy_args.instruction:="Insert SFP cable into NIC port"
+        "-p policy_args.instruction:=Insert SFP cable into NIC port"
+
+Usage (ROS 2) — Pi0.5 backend:
+    pixi run ros2 run aic_model aic_model \
+        --ros-args \
+        -p use_sim_time:=true \
+        -p policy:=aic_example_policies.ros.RunRLT \
+        -p policy_args.vla_backend:=pi05 \
+        -p policy_args.checkpoint_path:=/path/to/checkpoints/rlt/phase2_offline.pt \
+        -p policy_args.pi05_checkpoint:=/home/yifeng/workspace/pi05_base/pi05_base \
+        "-p policy_args.instruction:=insert the cable into the port"
 """
 
 import time
-from pathlib import Path
-from typing import Dict, Optional
+from typing import Optional
 
 import numpy as np
 import torch
-import cv2
-from geometry_msgs.msg import Twist, Vector3
+from geometry_msgs.msg import Twist, Vector3, Wrench
 from rclpy.node import Node
-
-# Default XVLA model directory (override via policy_args.vla_model_dir)
-DEFAULT_VLA_MODEL_DIR = "/home/yifeng/models/xvla-base"
-DEFAULT_INSTRUCTION = "Insert SFP cable into NIC port"
 
 from aic_model.policy import (
     GetObservationCallback,
@@ -62,62 +70,68 @@ from aic_model.policy import (
 from aic_model_interfaces.msg import Observation
 from aic_task_interfaces.msg import Task
 from aic_control_interfaces.msg import MotionUpdate, TrajectoryGenerationMode
-from geometry_msgs.msg import Wrench
 
 # RLT components
 from aic_rlt.models.rl_token import RLTokenModel, RLTokenConfig
 from aic_rlt.models.actor_critic import Actor, ActorCriticConfig
+from aic_rlt.vla import create_vla_backend
 
 
 # ---------------------------------------------------------------------------
-# Default checkpoint path (override via ROS parameter policy_args.checkpoint_path)
+# Defaults
 # ---------------------------------------------------------------------------
-DEFAULT_CHECKPOINT = ""
+DEFAULT_VLA_BACKEND   = "xvla"
+DEFAULT_VLA_MODEL_DIR = "/home/yifeng/models/xvla-base"          # XVLA
+DEFAULT_PI05_CKPT     = "/home/yifeng/workspace/pi05_base/pi05_base"  # Pi0.5
+DEFAULT_INSTRUCTION   = "Insert SFP cable into NIC port"
+DEFAULT_CHECKPOINT    = ""
 
 
 class RunRLT(Policy):
-    """RLT inference policy.
+    """RLT inference policy supporting XVLA and Pi0.5 VLA backends.
 
-    This class loads:
-      - A frozen VLA backbone (π0 or similar) to extract internal embeddings
-        and produce the VLA reference action chunk.
-      - The trained RL token encoder (frozen at inference).
-      - The trained RL actor (lightweight MLP).
-
-    All three are frozen at inference time; only the actor's output is used
-    for robot control.
+    Architecture (backend-agnostic):
+        VLA backbone (frozen) → embeddings (1, N, D_vla)
+        RL Token Encoder (frozen) → z_rl (D_rl)
+        Actor MLP (frozen) → action chunk (C, action_dim)
+        → MotionUpdate (Cartesian velocity) → aic_controller
     """
 
-    # Control loop frequency (Hz) – paper uses 50 Hz
-    CONTROL_HZ: float = 50.0
     # Action chunk length C (must match training)
     CHUNK_LENGTH: int = 10
-    # Action dimension (6D velocity delta + gripper)
+    # Action dimension: 6D velocity + gripper
     ACTION_DIM: int = 7
-    # Proprioceptive state dimension (TCP pose 7 + vel 6 + error 6 + joints 7)
+    # Proprioceptive state dimension
     PROP_DIM: int = 26
-    # Image scale factor (must match training data)
-    IMAGE_SCALE: float = 0.25
+
+    # Control rates per backend (Hz)
+    _CONTROL_HZ = {"xvla": 50.0, "pi05": 20.0}
 
     def __init__(self, parent_node: Node):
         super().__init__(parent_node)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # Declare then read parameters — ROS 2 raises if get_parameter() is called
-        # on an undeclared parameter, so declare with defaults first.
-        for name, default in [
-            ("policy_args.checkpoint_path", DEFAULT_CHECKPOINT),
-            ("policy_args.vla_model_dir",   DEFAULT_VLA_MODEL_DIR),
-            ("policy_args.instruction",     DEFAULT_INSTRUCTION),
-        ]:
+        # ---- Declare then read ROS parameters ----
+        _params = [
+            ("policy_args.vla_backend",      DEFAULT_VLA_BACKEND),
+            ("policy_args.checkpoint_path",  DEFAULT_CHECKPOINT),
+            ("policy_args.vla_model_dir",    DEFAULT_VLA_MODEL_DIR),
+            ("policy_args.pi05_checkpoint",  DEFAULT_PI05_CKPT),
+            ("policy_args.instruction",      DEFAULT_INSTRUCTION),
+        ]
+        for name, default in _params:
             try:
                 parent_node.declare_parameter(name, default)
             except Exception:
-                pass  # already declared
+                pass  # already declared by a previous init
 
+        vla_backend     = parent_node.get_parameter("policy_args.vla_backend").value
         checkpoint_path = parent_node.get_parameter("policy_args.checkpoint_path").value
         vla_model_dir   = parent_node.get_parameter("policy_args.vla_model_dir").value
+        pi05_checkpoint = parent_node.get_parameter("policy_args.pi05_checkpoint").value
         instruction     = parent_node.get_parameter("policy_args.instruction").value
+
+        self.control_hz = self._CONTROL_HZ.get(vla_backend, 50.0)
 
         if not checkpoint_path:
             self.get_logger().warn(
@@ -125,19 +139,20 @@ class RunRLT(Policy):
                 "Models will be randomly initialized – only useful for testing."
             )
 
-        # ---- Infer model config from checkpoint (if provided) ----
-        # The RLTokenConfig defaults may not match training; read dims from the
-        # saved weights to guarantee consistency.
-        rl_token_cfg = RLTokenConfig()
+        # ---- Load VLA backend ----
+        self._vla = self._load_vla_backend(
+            vla_backend, vla_model_dir, pi05_checkpoint, instruction
+        )
+
+        # ---- Build RLT models using VLA dimensions ----
+        rl_token_cfg = RLTokenConfig(
+            vla_embed_dim=self._vla.embed_dim,
+            num_vla_tokens=self._vla.num_tokens,
+        )
+
+        # Validate against checkpoint if provided
         if checkpoint_path:
-            _ckpt = torch.load(checkpoint_path, map_location="cpu")
-            _w = _ckpt["rl_token_model"]["input_proj.weight"]  # (encoder_dim, vla_embed_dim)
-            rl_token_cfg.vla_embed_dim = _w.shape[1]
-            _pe = _ckpt["rl_token_model"]["pos_enc.pe"]         # (1, num_vla_tokens+1, enc_dim)
-            rl_token_cfg.num_vla_tokens = _pe.shape[1] - 1
-            _rp = _ckpt["rl_token_model"]["readout_proj.weight"]  # (rl_token_dim, enc_dim)
-            rl_token_cfg.rl_token_dim = _rp.shape[0]
-            del _ckpt, _w, _pe, _rp
+            self._validate_checkpoint_dims(checkpoint_path, rl_token_cfg)
 
         actor_critic_cfg = ActorCriticConfig(
             rl_token_dim=rl_token_cfg.rl_token_dim,
@@ -153,17 +168,16 @@ class RunRLT(Policy):
         if checkpoint_path:
             self._load_checkpoint(checkpoint_path)
 
-        # Freeze all parameters at inference
+        # Freeze all RLT parameters at inference
         for model in (self.rl_token_model, self.actor):
             model.eval()
             for p in model.parameters():
                 p.requires_grad = False
 
-        # ---- VLA backbone ----
-        self._vla = self._load_vla(vla_model_dir, instruction)
-
         self.get_logger().info(
             f"RunRLT initialized on {self.device}. "
+            f"Backend: {vla_backend} "
+            f"(num_tokens={self._vla.num_tokens}, embed_dim={self._vla.embed_dim}). "
             f"Checkpoint: {checkpoint_path or '(none)'}"
         )
 
@@ -171,105 +185,98 @@ class RunRLT(Policy):
     # Initialization helpers
     # ------------------------------------------------------------------
 
+    def _load_vla_backend(
+        self,
+        backend: str,
+        vla_model_dir: str,
+        pi05_checkpoint: str,
+        instruction: str,
+    ):
+        """Instantiate the appropriate VLA backend."""
+        self.get_logger().info(f"Loading VLA backend: {backend}")
+
+        if backend == "xvla":
+            from pathlib import Path
+            if not Path(vla_model_dir).exists():
+                self.get_logger().warn(
+                    f"XVLA model directory not found: {vla_model_dir}. "
+                    "Using zero-output stub. "
+                    "Download with: python -c \"from huggingface_hub import snapshot_download; "
+                    f"snapshot_download('lerobot/xvla-base', local_dir='{vla_model_dir}')\""
+                )
+                return self._make_stub_backend()
+
+            return create_vla_backend(
+                "xvla",
+                device=self.device,
+                model_dir=vla_model_dir,
+                instruction=instruction,
+                image_size=256,
+                chunk_length=self.CHUNK_LENGTH,
+            )
+
+        elif backend == "pi05":
+            return create_vla_backend(
+                "pi05",
+                device=self.device,
+                checkpoint_dir=pi05_checkpoint,
+                chunk_length=self.CHUNK_LENGTH,
+                instruction=instruction,
+            )
+
+        else:
+            raise ValueError(
+                f"Unknown vla_backend '{backend}'. "
+                "Set policy_args.vla_backend to 'xvla' or 'pi05'."
+            )
+
+    def _make_stub_backend(self):
+        """Zero-output stub backend for connectivity testing without a VLA."""
+        # Use XVLA default dims so any checkpoint trained on XVLA will load
+        from aic_rlt.vla.base import VLABackend
+
+        device = self.device
+        chunk_length = self.CHUNK_LENGTH
+        action_dim = self.ACTION_DIM
+
+        class _StubBackend(VLABackend):
+            embed_dim = 1024
+            num_tokens = 115
+
+            def get_embeddings(self, obs):
+                return torch.zeros(1, self.num_tokens, self.embed_dim, device=device)
+
+            def get_action_chunk(self, obs):
+                return np.zeros((chunk_length, action_dim), dtype=np.float32)
+
+        self.get_logger().warn("Using zero-output stub VLA — actions will be zeros.")
+        return _StubBackend()
+
+    def _validate_checkpoint_dims(self, checkpoint_path: str, cfg: RLTokenConfig) -> None:
+        """Warn if checkpoint VLA dims don't match the loaded backend."""
+        try:
+            ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+            w = ckpt["rl_token_model"]["input_proj.weight"]  # (enc_dim, vla_embed_dim)
+            ckpt_vla_dim = w.shape[1]
+            if ckpt_vla_dim != cfg.vla_embed_dim:
+                self.get_logger().error(
+                    f"Checkpoint vla_embed_dim={ckpt_vla_dim} does not match "
+                    f"VLA backend embed_dim={cfg.vla_embed_dim}. "
+                    "The checkpoint was likely trained with a different VLA backend. "
+                    "Loading will proceed but inference results will be wrong."
+                )
+        except Exception as e:
+            self.get_logger().warn(f"Could not validate checkpoint dims: {e}")
+
     def _load_checkpoint(self, path: str) -> None:
         ckpt = torch.load(path, map_location=self.device)
         self.rl_token_model.load_state_dict(ckpt["rl_token_model"])
         self.actor.load_state_dict(ckpt["actor"])
         self.get_logger().info(f"RLT checkpoint loaded from {path}")
 
-    def _load_vla(self, model_dir: str, instruction: str):
-        """Load XVLA (lerobot/xvla-base) as the frozen VLA backbone.
-
-        Wraps XVLAWrapper in an adapter that accepts ROS Observation messages
-        and extracts the center camera image + proprioceptive state internally.
-
-        Falls back to a zero-output stub if the model directory does not exist,
-        so the pipeline can be tested for ROS connectivity before XVLA is available.
-
-        The returned object has:
-            vla.get_embeddings(obs) -> torch.Tensor (1, N, D_vla)
-            vla.get_action_chunk(obs) -> np.ndarray (C, action_dim)
-        """
-        if not Path(model_dir).exists():
-            self.get_logger().warn(
-                f"XVLA model directory not found: {model_dir}. "
-                "Using zero-output stub. "
-                "Download with: python -c \"from huggingface_hub import snapshot_download; "
-                f"snapshot_download('lerobot/xvla-base', local_dir='{model_dir}')\""
-            )
-
-            class _StubVLA:
-                def __init__(self, device, cfg: RLTokenConfig, C: int, D: int):
-                    self.device = device
-                    self.N = cfg.num_vla_tokens
-                    self.D_vla = cfg.vla_embed_dim
-                    self.C = C
-                    self.D = D
-
-                def get_embeddings(self, obs) -> torch.Tensor:
-                    return torch.zeros(1, self.N, self.D_vla, device=self.device)
-
-                def get_action_chunk(self, obs) -> np.ndarray:
-                    return np.zeros((self.C, self.D), dtype=np.float32)
-
-            return _StubVLA(self.device, RLTokenConfig(), self.CHUNK_LENGTH, self.ACTION_DIM)
-
-        self.get_logger().info(f"Loading XVLAWrapper from {model_dir} ...")
-        from aic_rlt.vla.xvla_wrapper import XVLAWrapper
-
-        xvla = XVLAWrapper(
-            model_dir=model_dir,
-            device=self.device,
-            instruction=instruction,
-            image_size=256,
-            chunk_length=self.CHUNK_LENGTH,
-        )
-        self.get_logger().info("XVLAWrapper loaded.")
-
-        # Adapter: accepts ROS Observation, extracts center image + prop state
-        extract_prop = self._extract_prop_state
-
-        class _XVLAAdapter:
-            def __init__(self, wrapper: XVLAWrapper, prop_fn):
-                self._xvla = wrapper
-                self._prop_fn = prop_fn
-
-            def get_embeddings(self, obs) -> torch.Tensor:
-                img_np = np.frombuffer(obs.center_image.data, dtype=np.uint8).reshape(
-                    obs.center_image.height, obs.center_image.width, 3
-                )
-                # (num_tokens, 1024) → unsqueeze batch dim → (1, num_tokens, 1024)
-                emb = self._xvla.get_embeddings(img_np)
-                return emb.unsqueeze(0)
-
-            def get_action_chunk(self, obs) -> np.ndarray:
-                img_np = np.frombuffer(obs.center_image.data, dtype=np.uint8).reshape(
-                    obs.center_image.height, obs.center_image.width, 3
-                )
-                prop = self._prop_fn(obs)
-                return self._xvla.get_action_chunk(img_np, prop)
-
-        return _XVLAAdapter(xvla, extract_prop)
-
     # ------------------------------------------------------------------
-    # Observation processing
+    # Observation encoding
     # ------------------------------------------------------------------
-
-    @staticmethod
-    def _img_to_tensor(raw_img, device: torch.device, scale: float) -> torch.Tensor:
-        img_np = np.frombuffer(raw_img.data, dtype=np.uint8).reshape(
-            raw_img.height, raw_img.width, 3
-        )
-        if scale != 1.0:
-            img_np = cv2.resize(img_np, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-        return (
-            torch.from_numpy(img_np)
-            .permute(2, 0, 1)
-            .float()
-            .div(255.0)
-            .unsqueeze(0)
-            .to(device)
-        )
 
     def _extract_prop_state(self, obs: Observation) -> np.ndarray:
         tcp_pose = obs.controller_state.tcp_pose
@@ -297,23 +304,23 @@ class RunRLT(Policy):
 
     def _encode_rl_state(self, obs: Observation):
         """Returns z_rl (1, D_rl), prop (1, prop_dim), ref_chunk (1, C, D) tensors."""
-        # VLA embeddings → RL token
-        vla_embeds = self._vla.get_embeddings(obs).to(self.device)  # (1, N, D_vla)
+        # Single VLA forward pass → embeddings + reference actions
+        vla_embeds, ref_np = self._vla.get_embeddings_and_actions(obs)
+        # vla_embeds: (1, N, D_vla) — already on device (from backend)
+        # ref_np:     (C, D)
+
         with torch.no_grad():
-            _, z_rl = self.rl_token_model.encode(vla_embeds)        # (1, D_rl)
+            _, z_rl = self.rl_token_model.encode(vla_embeds.to(self.device))  # (1, D_rl)
 
-        # VLA reference action chunk
-        ref_np = self._vla.get_action_chunk(obs)              # (C, D)
-        ref_t = torch.from_numpy(ref_np).unsqueeze(0).to(self.device)  # (1, C, D)
-
-        # Proprioception
-        prop_np = self._extract_prop_state(obs)
-        prop_t = torch.from_numpy(prop_np).unsqueeze(0).to(self.device)  # (1, prop_dim)
+        ref_t = torch.from_numpy(ref_np).unsqueeze(0).to(self.device)   # (1, C, D)
+        prop_t = torch.from_numpy(
+            self._extract_prop_state(obs)
+        ).unsqueeze(0).to(self.device)                                   # (1, prop_dim)
 
         return z_rl, prop_t, ref_t
 
     # ------------------------------------------------------------------
-    # Action execution helpers
+    # Action execution
     # ------------------------------------------------------------------
 
     def _action_to_motion_update(self, action: np.ndarray) -> MotionUpdate:
@@ -356,12 +363,10 @@ class RunRLT(Policy):
     ) -> bool:
         self.get_logger().info(f"RunRLT.insert_cable() start. Task: {task}")
 
-        dt = 1.0 / self.CONTROL_HZ
+        dt = 1.0 / self.control_hz
         timeout_sec = 60.0
         start_time = time.time()
 
-        # Action chunk buffer: we query the actor once per chunk, then
-        # execute individual actions within the chunk at 50 Hz.
         action_chunk: Optional[np.ndarray] = None
         chunk_step = self.CHUNK_LENGTH  # force re-query on first iteration
 
@@ -382,12 +387,10 @@ class RunRLT(Policy):
                 action_chunk = action_chunk_t.squeeze(0).cpu().numpy()  # (C, D)
                 chunk_step = 0
 
-            # Execute current step within chunk
-            action = action_chunk[chunk_step]  # (D,)
+            action = action_chunk[chunk_step]
             chunk_step += 1
 
-            motion_update = self._action_to_motion_update(action)
-            move_robot(motion_update=motion_update)
+            move_robot(motion_update=self._action_to_motion_update(action))
             send_feedback(f"RLT step {chunk_step}/{self.CHUNK_LENGTH}")
 
             elapsed = time.time() - loop_start

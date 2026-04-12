@@ -195,9 +195,15 @@ def parse_args():
                         help="LeRobot v3.0 dataset root (contains data/, meta/)")
     parser.add_argument("--embeddings_dir", type=str, default="",
                         help="Directory of pre-extracted XVLA embeddings (.pt files)")
-    # Phase 2 (online RL) arguments
+    # VLA backend (online RL)
+    parser.add_argument("--vla_backend", type=str, default="xvla",
+                        choices=["xvla", "pi05"],
+                        help="VLA backbone for online RL: 'xvla' (default) or 'pi05'")
     parser.add_argument("--vla_model_dir", type=str, default="/home/yifeng/models/xvla-base",
-                        help="XVLA model directory for online RL inference")
+                        help="XVLA model directory (used when --vla_backend=xvla)")
+    parser.add_argument("--pi05_checkpoint", type=str,
+                        default="/home/yifeng/workspace/pi05_base/pi05_base",
+                        help="Pi0.5 checkpoint directory (used when --vla_backend=pi05)")
     parser.add_argument("--instruction", type=str,
                         default="Insert SFP cable into NIC port")
     # Shared arguments
@@ -330,19 +336,30 @@ def main():
         )
 
     if args.mode in ("online_rl", "full"):
-        # --- Phase 2: online RL with live XVLA ---
-        from aic_rlt.vla.xvla_wrapper import XVLAWrapper
+        # --- Phase 2: online RL with live VLA backend ---
+        from aic_rlt.vla import create_vla_backend
 
-        # For online RL, re-use embedding dims from Phase 1 checkpoint or re-detect
-        if args.embeddings_dir:
-            vla_embed_dim, num_vla_tokens = _detect_embedding_dims(args.embeddings_dir)
-        else:
-            # Defaults — will be overridden if loading a checkpoint
-            vla_embed_dim, num_vla_tokens = 1024, 577
+        # Build backend kwargs from the selected backend
+        if args.vla_backend == "xvla":
+            backend_kwargs = dict(
+                model_dir=args.vla_model_dir,
+                instruction=args.instruction,
+                chunk_length=args.chunk_length,
+            )
+        else:  # pi05
+            backend_kwargs = dict(
+                checkpoint_dir=args.pi05_checkpoint,
+                instruction=args.instruction,
+                chunk_length=args.chunk_length,
+            )
 
+        logger.info(f"Loading VLA backend: {args.vla_backend}")
+        vla = create_vla_backend(args.vla_backend, device=device, **backend_kwargs)
+
+        # Build RLT config from VLA dimensions (authoritative source)
         rl_token_cfg = RLTokenConfig(
-            vla_embed_dim=vla_embed_dim,
-            num_vla_tokens=num_vla_tokens,
+            vla_embed_dim=vla.embed_dim,
+            num_vla_tokens=vla.num_tokens,
         )
         actor_critic_cfg = ActorCriticConfig(
             rl_token_dim=rl_token_cfg.rl_token_dim,
@@ -360,19 +377,13 @@ def main():
             checkpoint_dir=args.checkpoint_dir,
         )
 
-        vla = XVLAWrapper(
-            model_dir=args.vla_model_dir,
-            device=device,
-            instruction=args.instruction,
-            chunk_length=args.chunk_length,
-        )
-        env = AICEnvWrapper(vla=vla, prop_dim=actor_critic_cfg.prop_dim)
+        env = AICEnvWrapper(prop_dim=actor_critic_cfg.prop_dim)
 
         trainer = RLTTrainer(
             config=config,
             device=device,
             get_vla_embeddings=lambda obs: vla.get_embeddings(obs),
-            get_vla_action_chunk=lambda obs: vla.get_action_chunk(obs, env.get_prop_state(obs)),
+            get_vla_action_chunk=lambda obs: vla.get_action_chunk(obs),
             get_prop_state=lambda obs: env.get_prop_state(obs),
             env_step=lambda a: env.step(a),
             human_intervention=env.human_intervention,
