@@ -28,36 +28,63 @@ For ACT (the AIC baseline), add forward hooks on the transformer layers to captu
 intermediate embeddings and update `RLTokenConfig.vla_embed_dim` / `num_vla_tokens`
 to match.
 
-### 3. Phase 1 — Pretrain RL Token
+### 3. Pre-extract XVLA embeddings
 
-Requires: demonstration trajectories as `.pt` files, each containing
-`{"vla_embeddings": torch.Tensor(N, D_vla)}` extracted by running the VLA on recorded
-episodes.
+Before Phase 1 training you must run `prepare_embeddings.py` once to extract XVLA
+Florence-2 embeddings from your LeRobot v3.0 dataset and save them to disk.
+
+```bash
+pixi run python scripts/prepare_embeddings.py \
+    --data_dir /home/yifeng/aic_data \
+    --model_dir /home/yifeng/models/xvla-base \
+    --output_dir /home/yifeng/aic_data/embeddings \
+    --camera center_camera \
+    --batch_size 8
+```
+
+This reads every frame from the dataset's parquet files, runs each image through the
+XVLA encoder, and writes one file per episode:
+
+```
+<output_dir>/episode_0000.pt  →  {"vla_embeddings": Tensor(T, num_tokens, 1024)}
+<output_dir>/episode_0001.pt  →  ...
+```
+
+The script is idempotent — already-extracted episodes are skipped unless `--overwrite`
+is passed.
+
+### 4. Phase 1 — Pretrain RL Token
+
+Requires: the embeddings directory produced in step 3.
 
 ```bash
 python scripts/train.py \
     --mode pretrain_rl_token \
-    --demo_dir /path/to/demo/embeddings \
-    --checkpoint_dir checkpoints/rlt \
-    --vla_model_path /path/to/vla
+    --data_dir /home/yifeng/aic_data \
+    --embeddings_dir /home/yifeng/aic_data/embeddings \
+    --checkpoint_dir checkpoints/rlt
 ```
 
-### 4a. Phase 2 — Offline RL (trajectory data only)
+Embedding dimensions (`vla_embed_dim`, `num_vla_tokens`) are detected automatically
+from the first `.pt` file in `--embeddings_dir`.
 
-Requires: trajectory data with reward labels. Increase `--bc_coeff` to 2.0–5.0 to
-compensate for the lack of online coverage.
+### 5a. Phase 2 — Offline RL (trajectory data only)
+
+Requires: the Phase 1 checkpoint and the embeddings directory. Increase `--bc_coeff`
+to 2.0–5.0 to compensate for the lack of online coverage.
 
 ```bash
 python scripts/train.py \
     --mode offline_rl \
     --load_checkpoint checkpoints/rlt/phase1_rl_token.pt \
-    --trajectory_dir /path/to/trajectories \
+    --data_dir /home/yifeng/aic_data \
+    --embeddings_dir /home/yifeng/aic_data/embeddings \
     --checkpoint_dir checkpoints/rlt \
     --bc_coeff 3.0 \
-    --total_gradient_steps 50000
+    --n_offline_epochs 100
 ```
 
-### 4b. Phase 2 — Online RL (live robot or simulator)
+### 5b. Phase 2 — Online RL (live robot or simulator)
 
 Requires: real-time environment interaction. Replace `AICEnvWrapper` in `train.py` with
 real environment calls (MuJoCo, Gazebo, or the live robot via the AIC ROS 2 interface).
@@ -66,6 +93,7 @@ real environment calls (MuJoCo, Gazebo, or the live robot via the AIC ROS 2 inte
 python scripts/train.py \
     --mode online_rl \
     --load_checkpoint checkpoints/rlt/phase1_rl_token.pt \
+    --vla_model_dir /home/yifeng/models/xvla-base \
     --checkpoint_dir checkpoints/rlt \
     --n_warmup_steps 2000 \
     --total_env_steps 50000 \
@@ -580,10 +608,15 @@ aic_utils/aic_rlt/
 │   ├── models/
 │   │   ├── rl_token.py       # RL Token encoder-decoder (Section III-A)
 │   │   └── actor_critic.py   # Actor + twin-critic MLPs (Section III-B)
+│   ├── data/
+│   │   └── lerobot_dataset.py  # LeRobotEmbeddingDataset — reads pre-extracted .pt files
+│   ├── vla/
+│   │   └── xvla_wrapper.py   # XVLAWrapper — XVLA model interface
 │   ├── replay_buffer.py      # Off-policy replay buffer
 │   └── trainer.py            # Full training loop — Algorithm 1
 ├── scripts/
-│   └── train.py              # Entry-point with VLA + env stubs
+│   ├── prepare_embeddings.py # Step 3: offline XVLA embedding extraction (run once)
+│   └── train.py              # Steps 4-5: Phase 1 + Phase 2 training entry-point
 ├── setup.py
 └── README.md                 # This file
 
