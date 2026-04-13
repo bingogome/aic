@@ -12,18 +12,23 @@ Compatible with: RunACT, RunRLT (XVLA / Pi0.5 backends)
 
 ---
 
-## Step 1 — Start the eval container with ground truth
+## Step 1 — Generate a randomized config
 
-The default eval environment runs only **3 trials** before stopping. To collect
-more data, supply a custom `aic_engine` config via `aic_engine_config_file`.
-A ready-made config with 15 trials (3 scenarios × 5 pose variations) is at
-`aic_utils/sym_data/data_collection_config.yaml`.
+The default eval environment runs only **3 trials** before stopping. Generate
+a randomized config with as many trials as you need (3 scenarios × N):
 
 ```bash
-distrobox enter -r aic_eval -- /entrypoint.sh \
-    ground_truth:=true \
-    start_aic_engine:=true \
-    aic_engine_config_file:=/home/yifeng/aic/aic_utils/sym_data/data_collection_config.yaml
+pixi run python aic_utils/sym_data/generate_data_collection_config.py --episodes_per_scenario 100 --output /tmp/data_collection_config.yaml --seed 42
+```
+
+See `aic_utils/sym_data/generate_data_collection_config.py --help` for all options.
+
+---
+
+## Step 2 — Start the eval container with ground truth
+
+```bash
+distrobox enter -r aic_eval -- /entrypoint.sh ground_truth:=true start_aic_engine:=true "aic_engine_config_file:=/tmp/data_collection_config.yaml"
 ```
 
 Wait until the terminal shows `Retrying connection to aic_engine...` before
@@ -31,7 +36,7 @@ starting the collector.
 
 ---
 
-## Step 2 — Run CheatCodeDataCollector
+## Step 3 — Run CheatCodeDataCollector
 
 In a second terminal:
 
@@ -73,7 +78,7 @@ pixi run ros2 run aic_model aic_model --ros-args \
 
 ---
 
-## Step 3 — Convert to LeRobot v3.0
+## Step 4 — Convert to LeRobot v3.0
 
 ```bash
 pixi run python aic_utils/sym_data/convert_cheatcode_to_lerobot.py \
@@ -94,7 +99,7 @@ Output dataset: `~/aic_data_sym/cheatcode/cable_insertion/`
 
 ---
 
-## Step 4 — Train
+## Step 5 — Train
 
 ```bash
 # ACT
@@ -125,10 +130,5 @@ print(f'{len(eps)} episodes, {n_ok} successful ({100*n_ok//len(eps)}%)')
 Spot-check a converted episode:
 
 ```bash
-pixi run python -c "
-import pandas as pd
-df = pd.read_parquet('/home/yifeng/aic_data_sym/cheatcode/cable_insertion/data/chunk-000/episode_000000.parquet')
-print(df.columns.tolist())
-print(len(df), 'steps')
-"
+pixi run python -c "import pandas as pd; df = pd.read_parquet('/home/yifeng/aic_data_sym/data/chunk-000/file-000.parquet'); print(df.columns.tolist()); print(len(df), 'rows')"
 ```
