@@ -12,6 +12,41 @@ Compatible with: RunACT, RunRLT (XVLA / Pi0.5 backends)
 
 ---
 
+## How it works
+
+`CheatCodeDataCollector` subclasses `CheatCode` and uses a **move_robot wrapper**
+to record data without modifying the policy itself.
+
+The AIC framework calls `insert_cable(task, get_observation, move_robot, send_feedback)`
+passing `move_robot` as a callback — a plain function the policy should call whenever
+it wants to send a pose command to the robot.
+
+`CheatCodeDataCollector` intercepts this by substituting its own wrapper:
+
+```
+CheatCodeDataCollector.insert_cable()
+│
+├── define recording_move_robot(pose):
+│       ├── obs = get_observation()    # snapshot state at this exact moment
+│       ├── steps.append(state, pose)  # record (state, action) pair + images
+│       └── real_move_robot(pose)      # forward to the actual robot controller
+│
+└── super().insert_cable(..., move_robot=recording_move_robot)
+        │   CheatCode runs its approach + insertion loop (~530 steps)
+        │   Each step: reads TF → computes pose → calls recording_move_robot()
+        └── returns success
+```
+
+The wrapper is the only place where both pieces exist simultaneously:
+- **The action** — the pose CheatCode just computed from TF
+- **The state** — what the robot looked like at that exact moment
+
+`CheatCode` never calls `get_observation()` itself (it reads TF directly), so the
+wrapper must fetch it. `CheatCode` has no knowledge of recording — it just calls
+whatever `move_robot` function it was handed.
+
+---
+
 ## Step 1 — Generate a randomized config
 
 The default eval environment runs only **3 trials** before stopping. Generate
