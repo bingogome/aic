@@ -16,6 +16,7 @@
 #       -p output_dir:=/home/yifeng/aic_data_raw
 
 scoring:
+  record_bag: false
   topics:
     - topic:
         name: "/joint_states"

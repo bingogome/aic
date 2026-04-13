@@ -34,6 +34,7 @@ import yaml
 # ---------------------------------------------------------------------------
 
 SCORING = {
+    "record_bag": False,
     "topics": [
         {"topic": {"name": "/joint_states", "type": "sensor_msgs/msg/JointState"}},
         {"topic": {"name": "/tf", "type": "tf2_msgs/msg/TFMessage"}},
