@@ -154,7 +154,12 @@ class XVLAWrapper:
         logger.info(f"Loading tokenizer ({_TOKENIZER_NAME}) ...")
         self.tokenizer = AutoTokenizer.from_pretrained(_TOKENIZER_NAME)
 
-        # Tokenize the fixed instruction once
+        # Tokenize the initial instruction; can be swapped at runtime via
+        # set_instruction() for phase-conditioned RLT.
+        self._tokenize_and_cache(instruction)
+        logger.info("XVLAWrapper ready.")
+
+    def _tokenize_and_cache(self, instruction: str) -> None:
         tok = self.tokenizer(
             instruction,
             max_length=_TOKEN_MAX_LEN,
@@ -162,8 +167,14 @@ class XVLAWrapper:
             truncation=True,
             return_tensors="pt",
         )
-        self.input_ids = tok["input_ids"].to(device)   # (1, TOKEN_MAX_LEN)
-        logger.info("XVLAWrapper ready.")
+        self.instruction = instruction
+        self.input_ids = tok["input_ids"].to(self.device)  # (1, TOKEN_MAX_LEN)
+
+    def set_instruction(self, instruction: str) -> None:
+        """Re-tokenize and swap the cached prompt (phase-conditioned RLT)."""
+        if instruction == self.instruction:
+            return
+        self._tokenize_and_cache(instruction)
 
     # ------------------------------------------------------------------
     # Image preprocessing

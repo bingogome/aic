@@ -86,6 +86,21 @@ DEFAULT_PI05_CKPT     = "/home/yifeng/workspace/pi05_base/pi05_base"  # Pi0.5
 DEFAULT_INSTRUCTION   = "Insert SFP cable into NIC port"
 DEFAULT_CHECKPOINT    = ""
 
+# Phase-conditioned prompt defaults. Override via ROS params
+# policy_args.prompt_{approach,align,insert,verify}.
+DEFAULT_PHASE_PROMPTS = {
+    "approach": "move the SFP cable above the NIC port",
+    "align":    "align the SFP connector with the port opening",
+    "insert":   "insert the SFP cable straight into the port",
+    "verify":   "verify the SFP cable is fully seated in the port",
+}
+
+# Phase-estimator thresholds (must match RewardConfig defaults in trainer).
+_PHASE_D_ALIGN   = 0.03   # m, approach → align
+_PHASE_ORI_ALIGN = 0.05   # 1 - |q·qg|, align → insert
+_PHASE_ERR_CONTACT = 0.001  # tcp_err norm (m), align → insert
+_PHASE_D_VERIFY  = 0.005  # m, insert → verify
+
 
 class RunRLT(Policy):
     """RLT inference policy supporting XVLA and Pi0.5 VLA backends.
@@ -118,6 +133,14 @@ class RunRLT(Policy):
             ("policy_args.vla_model_dir",    DEFAULT_VLA_MODEL_DIR),
             ("policy_args.pi05_checkpoint",  DEFAULT_PI05_CKPT),
             ("policy_args.instruction",      DEFAULT_INSTRUCTION),
+            # Port pose for phase estimator (xyz + quat xyzw). Empty list
+            # disables phase switching; the VLA keeps the static instruction.
+            ("policy_args.port_pose_xyzquat", []),
+            # Per-phase prompts (can be overridden from launch file)
+            ("policy_args.prompt_approach",  DEFAULT_PHASE_PROMPTS["approach"]),
+            ("policy_args.prompt_align",     DEFAULT_PHASE_PROMPTS["align"]),
+            ("policy_args.prompt_insert",    DEFAULT_PHASE_PROMPTS["insert"]),
+            ("policy_args.prompt_verify",    DEFAULT_PHASE_PROMPTS["verify"]),
         ]
         for name, default in _params:
             try:
@@ -130,6 +153,22 @@ class RunRLT(Policy):
         vla_model_dir   = parent_node.get_parameter("policy_args.vla_model_dir").value
         pi05_checkpoint = parent_node.get_parameter("policy_args.pi05_checkpoint").value
         instruction     = parent_node.get_parameter("policy_args.instruction").value
+
+        # Phase prompts + port pose (optional)
+        self._phase_prompts = {
+            "approach": parent_node.get_parameter("policy_args.prompt_approach").value,
+            "align":    parent_node.get_parameter("policy_args.prompt_align").value,
+            "insert":   parent_node.get_parameter("policy_args.prompt_insert").value,
+            "verify":   parent_node.get_parameter("policy_args.prompt_verify").value,
+        }
+        port_pose = list(parent_node.get_parameter("policy_args.port_pose_xyzquat").value)
+        if len(port_pose) == 7:
+            self._port_pos = np.asarray(port_pose[0:3], dtype=np.float64)
+            self._port_quat = np.asarray(port_pose[3:7], dtype=np.float64)
+        else:
+            self._port_pos = None
+            self._port_quat = None
+        self._current_phase: Optional[str] = None
 
         self.control_hz = self._CONTROL_HZ.get(vla_backend, 50.0)
 
@@ -323,6 +362,43 @@ class RunRLT(Policy):
     # Action execution
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Phase estimation (port-relative) + prompt switching
+    # ------------------------------------------------------------------
+
+    def _estimate_phase(self, prop: np.ndarray) -> str:
+        """Pick a phase name from TCP pose + port pose. Falls back to 'approach'
+        when no port pose is configured."""
+        if self._port_pos is None or self._port_quat is None:
+            return "approach"
+        pos = prop[0:3]
+        quat = prop[3:7]
+        err_norm = float(np.linalg.norm(prop[13:16]))
+        d = float(np.linalg.norm(pos - self._port_pos))
+        ori_sim = abs(float(np.dot(quat, self._port_quat)))
+        ori_err = 1.0 - ori_sim
+        if d <= _PHASE_D_VERIFY:
+            return "verify"
+        if d <= _PHASE_D_ALIGN and ori_err <= _PHASE_ORI_ALIGN and err_norm > _PHASE_ERR_CONTACT:
+            return "insert"
+        if d <= _PHASE_D_ALIGN:
+            return "align"
+        return "approach"
+
+    def _maybe_switch_prompt(self, phase: str) -> None:
+        """Call backend.set_instruction when the phase changes."""
+        if phase == self._current_phase:
+            return
+        prompt = self._phase_prompts.get(phase)
+        if not prompt:
+            return
+        try:
+            self._vla.set_instruction(prompt)
+            self.get_logger().info(f"Phase → {phase}: prompt='{prompt}'")
+            self._current_phase = phase
+        except Exception as e:
+            self.get_logger().warn(f"set_instruction failed on phase={phase}: {e}")
+
     def _action_to_motion_update(self, action: np.ndarray) -> MotionUpdate:
         """Convert a 7-dim TCP pose action to a MotionUpdate (Cartesian position target).
 
@@ -388,6 +464,11 @@ class RunRLT(Policy):
 
             # Re-query actor at the start of each new chunk
             if chunk_step >= self.CHUNK_LENGTH:
+                # Update phase-conditioned prompt from current proprioception
+                # *before* we encode — so the VLA sees the right prompt.
+                prop_np = self._extract_prop_state(obs)
+                self._maybe_switch_prompt(self._estimate_phase(prop_np))
+
                 z_rl, prop, ref_chunk = self._encode_rl_state(obs)
                 with torch.no_grad():
                     action_chunk_t = self.actor.get_mean(z_rl, prop, ref_chunk)  # (1, C, D)

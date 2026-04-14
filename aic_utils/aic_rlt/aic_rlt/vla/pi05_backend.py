@@ -243,6 +243,16 @@ class Pi05Backend(VLABackend):
     # VLABackend interface
     # ------------------------------------------------------------------
 
+    def set_instruction(self, instruction: str) -> None:
+        """Swap the active Pi0.5 prompt.
+
+        Pi0.5's create_trained_policy stores the default_prompt internally,
+        but `_obs_to_pi05_input` re-emits it per call via ``self._instruction``,
+        so updating the attribute is sufficient for subsequent inferences.
+        """
+        if instruction != self._instruction:
+            self._instruction = instruction
+
     def get_embeddings(self, obs) -> torch.Tensor:
         """(1, num_tokens, embed_dim) on device."""
         prefix_embeds, _ = self._run_forward_with_embeddings(obs)

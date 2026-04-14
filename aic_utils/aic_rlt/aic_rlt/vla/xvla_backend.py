@@ -120,6 +120,10 @@ class XVLABackend(VLABackend):
     # VLABackend interface
     # ------------------------------------------------------------------
 
+    def set_instruction(self, instruction: str) -> None:
+        """Swap the active prompt (forwards to the underlying XVLAWrapper)."""
+        self._wrapper.set_instruction(instruction)
+
     def get_embeddings(self, obs) -> torch.Tensor:
         """(1, num_tokens, embed_dim) on device."""
         img = self._extract_center_image(obs)
