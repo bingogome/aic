@@ -68,6 +68,13 @@ PHASE_INSERT = 2
 PHASE_VERIFY = 3
 PHASE_NAMES = ("approach", "align", "insert", "verify")
 
+DEFAULT_PHASE_PROMPTS = (
+    "move the SFP cable above the NIC port",
+    "align the SFP connector with the port opening",
+    "insert the SFP cable straight into the port",
+    "verify the SFP cable is fully seated in the port",
+)
+
 
 @dataclass
 class RewardConfig:
@@ -109,6 +116,11 @@ class RewardConfig:
     ori_align_thresh: float = 0.05
     d_verify_thresh: float = 0.005
 
+    # Reward normalization: normalize chunk returns to zero mean / unit std
+    # before storing in the replay buffer. Prevents Q-value divergence with
+    # large reward scales.
+    normalize: bool = True
+
 
 # ---------------------------------------------------------------------------
 # Training configuration
@@ -123,7 +135,7 @@ class RLTConfig:
     actor_critic: ActorCriticConfig = field(default_factory=ActorCriticConfig)
 
     # ---- Replay Buffer ----
-    replay_buffer_capacity: int = 100_000
+    replay_buffer_capacity: int = 200_000
 
     # ---- Warmup ----
     # Number of environment steps to collect with frozen VLA before RL starts
@@ -143,7 +155,7 @@ class RLTConfig:
     # TD3 target network EMA coefficient
     tau: float = 0.005
     # BC regularizer coefficient β (equation (5))
-    bc_coeff: float = 1.0
+    bc_coeff: float = 5.0
     # TD3 target policy noise
     target_policy_noise: float = 0.2
     target_noise_clip: float = 0.5
@@ -509,20 +521,22 @@ class RLTTrainer:
                 "(legacy behavior; policy will target world coords, not the port)."
             )
 
-        reward_hist: List[float] = []
+        # Pass 1: encode episodes and compute raw chunk returns.
+        # Transitions are accumulated into a list so we can normalize rewards
+        # across the entire dataset before committing to the replay buffer.
+        pending: List[Tuple[Transition, int]] = []  # (transition, ep_idx)
         n_with_ref = 0
         n_without_ref = 0
+        n_phase_matched = 0
 
         for ep_idx, ep_data in sorted(demo_dataset._episodes.items()):
             T = ep_data["T"]
             props: np.ndarray = ep_data["props"]         # (T, 26)
             actions: np.ndarray = ep_data["actions"]     # (T, 7)
             embeddings: torch.Tensor = ep_data["embeddings"]  # (T, num_tokens, embed_dim)
-            # Pre-extracted VLA reference action chunks, if available.
-            # Shape: (T, C, 7). None if prepare_embeddings was run without
-            # --extract_ref_actions (legacy), in which case we fall back to
-            # demo actions as the reference (train/deploy mismatch).
             ref_actions_ep: Optional[np.ndarray] = ep_data.get("ref_actions")
+            phase_embeddings: Optional[dict] = ep_data.get("phase_embeddings")
+            phase_ref_actions: Optional[dict] = ep_data.get("phase_ref_actions")
 
             # Goal pose: fixed port frame if configured, else demo endpoint
             if fixed_port_pos is not None:
@@ -532,18 +546,36 @@ class RLTTrainer:
                 goal_pos = props[-1, 0:3].astype(np.float64)
                 goal_quat = props[-1, 3:7].astype(np.float64)
 
-            # Batch-encode all frames → z_rl (T, D_rl)
+            # Infer phases early — needed to select phase-matched embeddings.
+            phases = _infer_phases(props, goal_pos, goal_quat, rcfg)
+            has_phase_embs = (phase_embeddings is not None
+                              and all(n in phase_embeddings for n in PHASE_NAMES))
+
+            # Batch-encode all frames → z_rl (T, D_rl).
+            # When phase embeddings are available, each frame uses the
+            # embedding extracted with its phase-matched prompt.
+            if has_phase_embs:
+                # Build a per-frame embedding tensor by picking the right
+                # phase variant for each frame.
+                mixed_embs = torch.empty_like(embeddings)
+                for t in range(T):
+                    pname = PHASE_NAMES[phases[t]]
+                    mixed_embs[t] = phase_embeddings[pname][t]
+                emb_source = mixed_embs
+                n_phase_matched += 1
+            else:
+                emb_source = embeddings
+
             z_rls_list = []
             for t0 in range(0, T, encode_batch):
                 t1 = min(t0 + encode_batch, T)
-                emb_batch = embeddings[t0:t1].to(self.device)  # (B, N, D)
+                emb_batch = emb_source[t0:t1].to(self.device)  # (B, N, D)
                 with torch.no_grad():
                     _, z_rl_batch = self.rl_token_model.encode(emb_batch)  # (B, D_rl)
                 z_rls_list.append(z_rl_batch.cpu().numpy())
             z_rls = np.concatenate(z_rls_list, axis=0)  # (T, D_rl)
 
-            # Per-frame phases and rewards (length T)
-            phases = _infer_phases(props, goal_pos, goal_quat, rcfg)
+            # Per-frame rewards (phases already inferred above for embedding selection)
             if rcfg.mode == "structured":
                 rewards = _compute_structured_reward(
                     props, goal_pos, goal_quat, phases, rcfg
@@ -552,13 +584,7 @@ class RLTTrainer:
                 d2 = np.sum((props[:, 0:3] - goal_pos) ** 2, axis=1)
                 rewards = np.exp(-d2 / (rcfg.sigma_pos ** 2)).astype(np.float32)
 
-            # Chunk reward stored in the buffer: C-step discounted return
-            #   R_t = Σ_{k=0..C-1} γ^k · rewards[min(t+k, T-1)]
-            # This is what the TD backup q_target = R_t + γ^C·Q' implicitly
-            # expects, and is the only way for the success bonus (which lives
-            # on verify-phase frames at t ∈ [T-C, T-1]) to actually reach a
-            # stored transition — without this, verify frames are never a
-            # valid chunk start and the +w_success term is dropped.
+            # C-step discounted return per chunk start
             gamma = float(self.config.gamma)
             chunk_returns = np.zeros(T, dtype=np.float32)
             for t in range(T):
@@ -575,29 +601,33 @@ class RLTTrainer:
             else:
                 n_without_ref += 1
 
-            # Add one transition per valid chunk start
+            has_phase_refs = (phase_ref_actions is not None
+                              and all(n in phase_ref_actions for n in PHASE_NAMES))
+
             n_added = 0
             for t in range(T - C + 1):
-                action_chunk = actions[t : t + C]          # (C, 7)  — executed (demo)
-                if ref_actions_ep is not None:
-                    ref_chunk = ref_actions_ep[t]          # (C, 7)  — VLA reference
+                action_chunk = actions[t : t + C]
+                # Pick reference: phase-matched > default VLA > demo copy
+                if has_phase_refs:
+                    pname = PHASE_NAMES[phases[t]]
+                    ref_chunk = phase_ref_actions[pname][t]
+                elif ref_actions_ep is not None:
+                    ref_chunk = ref_actions_ep[t]
                 else:
-                    ref_chunk = action_chunk.copy()        # fallback (legacy)
+                    ref_chunk = action_chunk.copy()
                 t_next = min(t + 1, T - 1)
-                done = float(t == T - C)                   # 1.0 at last valid chunk
+                done = float(t == T - C)
 
-                r_chunk = float(chunk_returns[t])
-                self.replay_buffer.add(Transition(
+                pending.append((Transition(
                     z_rl=z_rls[t],
                     prop=props[t],
                     action_chunk=action_chunk,
                     ref_action_chunk=ref_chunk,
-                    reward=r_chunk,
+                    reward=float(chunk_returns[t]),
                     next_z_rl=z_rls[t_next],
                     next_prop=props[t_next],
                     done=done,
-                ))
-                reward_hist.append(r_chunk)
+                ), ep_idx))
                 n_added += 1
 
             ph_counts = [int(np.sum(phases == p)) for p in range(4)]
@@ -608,27 +638,55 @@ class RLTTrainer:
                 float(rewards.min()), float(rewards.mean()), float(rewards.max()),
             )
 
-        if reward_hist:
-            arr = np.asarray(reward_hist, dtype=np.float32)
+        # Pass 2: normalize rewards and commit to replay buffer.
+        raw_rewards = np.array([tr.reward for tr, _ in pending], dtype=np.float32)
+        if rcfg.normalize and len(raw_rewards) > 1:
+            r_mean = float(raw_rewards.mean())
+            r_std = float(raw_rewards.std())
+            if r_std < 1e-8:
+                r_std = 1.0
             logger.info(
-                "Replay reward stats over %d transitions: min=%.3f p50=%.3f mean=%.3f p95=%.3f max=%.3f",
-                len(arr), float(arr.min()), float(np.median(arr)),
-                float(arr.mean()), float(np.percentile(arr, 95)), float(arr.max()),
+                "Reward normalization: mean=%.3f std=%.3f → shifting to zero mean, unit std",
+                r_mean, r_std,
             )
+            normed_rewards = (raw_rewards - r_mean) / r_std
+        else:
+            normed_rewards = raw_rewards
+
+        for i, (tr, _ep) in enumerate(pending):
+            tr.reward = float(normed_rewards[i])
+            self.replay_buffer.add(tr)
+
+        logger.info(
+            "Replay reward stats over %d transitions (after normalization=%s): "
+            "min=%.3f p50=%.3f mean=%.3f p95=%.3f max=%.3f",
+            len(normed_rewards), rcfg.normalize,
+            float(normed_rewards.min()), float(np.median(normed_rewards)),
+            float(normed_rewards.mean()), float(np.percentile(normed_rewards, 95)),
+            float(normed_rewards.max()),
+        )
+        n_total_eps = n_with_ref + n_without_ref
         if n_without_ref > 0:
             logger.warning(
                 "Phase 2: %d/%d episodes have NO pre-extracted VLA ref_actions; "
-                "falling back to demo actions as the reference. This creates a "
-                "train/deploy mismatch because the actor is regularized toward "
-                "demo actions at train time but conditioned on live VLA chunks "
-                "at deploy. Re-run prepare_embeddings.py with --extract_ref_actions "
-                "to fix.",
-                n_without_ref, n_with_ref + n_without_ref,
+                "falling back to demo actions as the reference.",
+                n_without_ref, n_total_eps,
             )
         else:
             logger.info(
                 "Phase 2: using pre-extracted VLA ref_actions for all %d episodes.",
                 n_with_ref,
+            )
+        if n_phase_matched > 0:
+            logger.info(
+                "Phase 2: %d/%d episodes used phase-matched embeddings+refs "
+                "(approach/align/insert/verify prompts).",
+                n_phase_matched, n_total_eps,
+            )
+        else:
+            logger.info(
+                "Phase 2: no phase-conditioned embeddings found; using single-prompt "
+                "embeddings. Re-run prepare_embeddings.py --extract_phase_prompts to fix."
             )
 
     def pretrain_rl_token(self, demo_dataset: "torch.utils.data.Dataset") -> None:
