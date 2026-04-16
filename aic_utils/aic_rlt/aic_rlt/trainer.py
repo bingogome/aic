@@ -61,6 +61,66 @@ from .replay_buffer import ReplayBuffer, Transition
 
 logger = logging.getLogger(__name__)
 
+# Phase ids used by structured reward + phase-conditioned prompts.
+PHASE_APPROACH = 0
+PHASE_ALIGN = 1
+PHASE_INSERT = 2
+PHASE_VERIFY = 3
+PHASE_NAMES = ("approach", "align", "insert", "verify")
+
+DEFAULT_PHASE_PROMPTS = (
+    "move the SFP cable above the NIC port",
+    "align the SFP connector with the port opening",
+    "insert the SFP cable straight into the port",
+    "verify the SFP cable is fully seated in the port",
+)
+
+
+@dataclass
+class RewardConfig:
+    """Structured reward configuration for SFP→NIC insertion.
+
+    mode="legacy" reproduces the original distance-only Gaussian reward.
+    mode="structured" enables the phase-aware multi-term reward.
+    """
+    mode: str = "legacy"  # "legacy" | "structured"
+
+    # Term weights (structured only)
+    w_pos: float = 1.0
+    w_ori: float = 0.3
+    w_depth: float = 0.5
+    w_contact: float = 0.2
+    w_phase_bonus: float = 1.0
+    w_success: float = 10.0
+
+    # Position Gaussian width (meters)
+    sigma_pos: float = 0.03
+
+    # Port frame override. If None, port is per-episode demo endpoint.
+    # port_pos: (x,y,z); port_quat: (qx,qy,qz,qw)
+    port_pos: Optional[Tuple[float, float, float]] = None
+    port_quat: Optional[Tuple[float, float, float, float]] = None
+
+    # Insertion axis in port frame (0=x, 1=y, 2=z). Depth measured along
+    # this axis of the port frame; positive = deeper into the port.
+    port_insert_axis: int = 2
+    insert_depth_m: float = 0.03  # ramp range for depth reward
+
+    # Contact term uses tcp_err as a wrench proxy (stiffness * err ≈ force).
+    # Reward axial err in band; penalize lateral err.
+    contact_axial_band: Tuple[float, float] = (0.001, 0.005)  # meters
+    contact_lateral_scale: float = 0.005
+
+    # Phase thresholds (all in meters / 1-|q·qg|)
+    d_align_thresh: float = 0.03
+    ori_align_thresh: float = 0.05
+    d_verify_thresh: float = 0.005
+
+    # Reward normalization: normalize chunk returns to zero mean / unit std
+    # before storing in the replay buffer. Prevents Q-value divergence with
+    # large reward scales.
+    normalize: bool = True
+
 
 # ---------------------------------------------------------------------------
 # Training configuration
@@ -75,7 +135,7 @@ class RLTConfig:
     actor_critic: ActorCriticConfig = field(default_factory=ActorCriticConfig)
 
     # ---- Replay Buffer ----
-    replay_buffer_capacity: int = 100_000
+    replay_buffer_capacity: int = 200_000
 
     # ---- Warmup ----
     # Number of environment steps to collect with frozen VLA before RL starts
@@ -95,7 +155,7 @@ class RLTConfig:
     # TD3 target network EMA coefficient
     tau: float = 0.005
     # BC regularizer coefficient β (equation (5))
-    bc_coeff: float = 1.0
+    bc_coeff: float = 5.0
     # TD3 target policy noise
     target_policy_noise: float = 0.2
     target_noise_clip: float = 0.5
@@ -109,10 +169,137 @@ class RLTConfig:
     actor_lr: float = 3e-4
     critic_lr: float = 3e-4
 
+    # ---- Reward shaping (offline RL) ----
+    reward: RewardConfig = field(default_factory=RewardConfig)
+
     # ---- Logging / Saving ----
     log_interval: int = 100   # gradient steps
     save_interval: int = 1000  # gradient steps
     checkpoint_dir: str = "checkpoints/rlt"
+
+
+# ---------------------------------------------------------------------------
+# Reward / phase helpers
+# ---------------------------------------------------------------------------
+
+def _quat_xyzw_to_mat(q: np.ndarray) -> np.ndarray:
+    """Quaternion [qx,qy,qz,qw] → 3x3 rotation matrix."""
+    x, y, z, w = float(q[0]), float(q[1]), float(q[2]), float(q[3])
+    n = x * x + y * y + z * z + w * w
+    if n < 1e-12:
+        return np.eye(3, dtype=np.float64)
+    s = 2.0 / n
+    xx, yy, zz = x * x * s, y * y * s, z * z * s
+    xy, xz, yz = x * y * s, x * z * s, y * z * s
+    wx, wy, wz = w * x * s, w * y * s, w * z * s
+    return np.array(
+        [
+            [1.0 - (yy + zz), xy - wz, xz + wy],
+            [xy + wz, 1.0 - (xx + zz), yz - wx],
+            [xz - wy, yz + wx, 1.0 - (xx + yy)],
+        ],
+        dtype=np.float64,
+    )
+
+
+def _infer_phases(
+    props: np.ndarray,
+    goal_pos: np.ndarray,
+    goal_quat: np.ndarray,
+    rcfg: RewardConfig,
+) -> np.ndarray:
+    """Label each frame with a phase id based on pose proximity to the goal.
+
+    Logic (nested):
+      verify  ← d ≤ d_verify_thresh
+      inside the d_align_thresh ball:
+        insert ← orientation already aligned AND axial-contact proxy is
+                 non-trivial (|axial tcp_err| above the band lower bound)
+        align  ← otherwise (close in position, but still rotating or free)
+      approach ← outside the alignment ball
+
+    No wrench is available in props[26], so axial tcp_err (projection onto the
+    port insert axis) is used as a contact proxy — stiffness × axial_err ≈
+    axial force. Lateral err does not count as "in contact" for this purpose.
+    """
+    T = props.shape[0]
+    phases = np.full(T, PHASE_APPROACH, dtype=np.int64)
+    R_port = _quat_xyzw_to_mat(goal_quat)
+    port_axis = R_port[:, rcfg.port_insert_axis]  # world-frame unit vec
+    contact_lo = float(rcfg.contact_axial_band[0])
+
+    d = np.linalg.norm(props[:, 0:3] - goal_pos, axis=1)         # (T,)
+    o_err = 1.0 - np.abs(props[:, 3:7] @ goal_quat)              # (T,)
+    axial_err = np.abs(props[:, 13:16] @ port_axis)               # (T,)
+
+    # Order matters: later assignments overwrite earlier ones.
+    align_mask = d <= rcfg.d_align_thresh
+    phases[align_mask] = PHASE_ALIGN
+
+    insert_mask = align_mask & (o_err <= rcfg.ori_align_thresh) & (axial_err > contact_lo)
+    phases[insert_mask] = PHASE_INSERT
+
+    verify_mask = d <= rcfg.d_verify_thresh
+    phases[verify_mask] = PHASE_VERIFY
+
+    return phases
+
+
+def _compute_structured_reward(
+    props: np.ndarray,
+    goal_pos: np.ndarray,
+    goal_quat: np.ndarray,
+    phases: np.ndarray,
+    rcfg: RewardConfig,
+) -> np.ndarray:
+    """Per-frame scalar reward combining position, orientation, insertion
+    depth, contact band, and phase-transition bonuses."""
+    T = props.shape[0]
+    R_port = _quat_xyzw_to_mat(goal_quat)
+    port_axis = R_port[:, rcfg.port_insert_axis]  # (3,) world-frame unit vec
+
+    pos = props[:, 0:3]       # (T, 3)
+    quat = props[:, 3:7]      # (T, 4)
+    err = props[:, 13:16]     # (T, 3) controller pose error (proxy for contact)
+
+    # 1. Position Gaussian → [0, 1]
+    d = np.linalg.norm(pos - goal_pos, axis=1)
+    r_pos = np.exp(-(d ** 2) / (rcfg.sigma_pos ** 2))
+
+    # 2. Orientation alignment → [0, 1]
+    r_ori = np.abs(quat @ goal_quat)
+
+    # 3. Insertion depth ramp → [0, 1]
+    proj = (pos - goal_pos) @ port_axis
+    r_depth = np.clip(-proj / max(rcfg.insert_depth_m, 1e-6), 0.0, 1.0)
+
+    # 4. Contact term
+    axial_scalar = err @ port_axis                                # (T,)
+    axial_err = np.abs(axial_scalar)
+    lateral_vec = err - np.outer(axial_scalar, port_axis)         # (T, 3)
+    lateral_err = np.linalg.norm(lateral_vec, axis=1)
+    lo, hi = rcfg.contact_axial_band
+    axial_in_band = ((axial_err >= lo) & (axial_err <= hi)).astype(np.float32)
+    r_contact = np.clip(
+        axial_in_band - lateral_err / max(rcfg.contact_lateral_scale, 1e-6),
+        -1.0, 1.0,
+    )
+
+    # Weighted sum
+    rewards = (rcfg.w_pos * r_pos
+               + rcfg.w_ori * r_ori
+               + rcfg.w_depth * r_depth
+               + rcfg.w_contact * r_contact).astype(np.float32)
+
+    # 5. Sparse phase-transition bonus
+    phase_advanced = np.zeros(T, dtype=np.float32)
+    phase_advanced[1:] = (phases[1:] > phases[:-1]).astype(np.float32)
+    rewards += rcfg.w_phase_bonus * phase_advanced
+
+    # 6. Success bonus on verify
+    rewards += rcfg.w_success * (phases == PHASE_VERIFY).astype(np.float32)
+
+    return rewards
 
 
 # ---------------------------------------------------------------------------
@@ -214,7 +401,7 @@ class RLTTrainer:
         self,
         demo_dataset: "torch.utils.data.Dataset",
         n_epochs: int = 100,
-        reward_sigma: float = 0.05,
+        reward_sigma: Optional[float] = None,
     ) -> None:
         """Offline actor-critic training using demo data with synthetic rewards (TD3+BC).
 
@@ -232,9 +419,18 @@ class RLTTrainer:
         Args:
             demo_dataset: LeRobotEmbeddingDataset with _episodes attribute.
             n_epochs:     Gradient epochs (one epoch ≈ buffer_size / batch_size steps).
-            reward_sigma: Gaussian width for distance-to-goal reward (meters).
+            reward_sigma: Legacy-mode Gaussian width (meters). If provided and
+                          reward mode is "legacy", overrides config.reward.sigma_pos.
+                          Ignored for "structured" mode.
         """
-        logger.info("=== Phase 2 (Offline): Actor-Critic Training with Synthetic Rewards ===")
+        logger.info(
+            "=== Phase 2 (Offline): Actor-Critic Training (reward_mode=%s) ===",
+            self.config.reward.mode,
+        )
+
+        # Legacy sigma override for backward compatibility with old CLI.
+        if reward_sigma is not None and self.config.reward.mode == "legacy":
+            self.config.reward.sigma_pos = float(reward_sigma)
 
         # Freeze RL token
         for p in self.rl_token_model.parameters():
@@ -243,7 +439,7 @@ class RLTTrainer:
 
         # Pre-compute z_rl and populate replay buffer episode by episode
         logger.info("Encoding RL tokens and populating replay buffer ...")
-        self._populate_replay_buffer_from_demos(demo_dataset, reward_sigma)
+        self._populate_replay_buffer_from_demos(demo_dataset)
         logger.info(f"Replay buffer size: {len(self.replay_buffer)} transitions")
 
         # CSV logging for Phase 2
@@ -282,61 +478,223 @@ class RLTTrainer:
     def _populate_replay_buffer_from_demos(
         self,
         demo_dataset: "torch.utils.data.Dataset",
-        reward_sigma: float,
     ) -> None:
         """Encode all demo frames with the frozen RL token and add to replay buffer.
 
-        For each episode:
-          - Run rl_token_model.encode() in batches to get z_rl[0..T-1]
-          - Compute r(t) = exp(-||pos(t) - pos(T-1)||² / reward_sigma²)
-          - For each valid chunk start t: add Transition(z_rl[t], prop[t], ...)
+        Reward is either legacy (position-only Gaussian) or structured
+        (position + orientation + depth + contact + phase bonuses), controlled
+        by self.config.reward.mode. If a port pose is configured, it replaces
+        the per-episode demo-endpoint goal with a fixed port-frame goal — this
+        is what makes the policy target the *port*, not a world-coordinate
+        point that happened to match the demos.
         """
         C = self.config.actor_critic.chunk_length
         encode_batch = 64  # frames per GPU batch for encoding
+        rcfg = self.config.reward
+
+        # Auto-size replay buffer so all demo transitions fit.
+        total_transitions = sum(
+            max(ep["T"] - C + 1, 0) for ep in demo_dataset._episodes.values()
+        )
+        needed = int(max(total_transitions * 1.1, self.replay_buffer.capacity))
+        if needed > self.replay_buffer.capacity:
+            logger.info(
+                "Resizing replay buffer: %d → %d (dataset has %d transitions)",
+                self.replay_buffer.capacity, needed, total_transitions,
+            )
+            cfg = self.config.actor_critic
+            self.replay_buffer = ReplayBuffer(
+                capacity=needed,
+                rl_token_dim=cfg.rl_token_dim,
+                prop_dim=cfg.prop_dim,
+                action_dim=cfg.action_dim,
+                chunk_length=cfg.chunk_length,
+                device=self.device,
+            )
+
+        # Resolve port-frame goal (shared across episodes, if provided).
+        fixed_port_pos: Optional[np.ndarray] = None
+        fixed_port_quat: Optional[np.ndarray] = None
+        if rcfg.port_pos is not None and rcfg.port_quat is not None:
+            fixed_port_pos = np.asarray(rcfg.port_pos, dtype=np.float64)
+            fixed_port_quat = np.asarray(rcfg.port_quat, dtype=np.float64)
+            logger.info(
+                "Using fixed port pose: pos=%s quat=%s", fixed_port_pos.tolist(),
+                fixed_port_quat.tolist(),
+            )
+        else:
+            logger.info(
+                "No port pose configured — using per-episode demo endpoint "
+                "(legacy behavior; policy will target world coords, not the port)."
+            )
+
+        # Pass 1: encode episodes and compute raw chunk returns.
+        # Transitions are accumulated into a list so we can normalize rewards
+        # across the entire dataset before committing to the replay buffer.
+        pending: List[Tuple[Transition, int]] = []  # (transition, ep_idx)
+        n_with_ref = 0
+        n_without_ref = 0
+        n_phase_matched = 0
 
         for ep_idx, ep_data in sorted(demo_dataset._episodes.items()):
             T = ep_data["T"]
             props: np.ndarray = ep_data["props"]         # (T, 26)
             actions: np.ndarray = ep_data["actions"]     # (T, 7)
             embeddings: torch.Tensor = ep_data["embeddings"]  # (T, num_tokens, embed_dim)
+            ref_actions_ep: Optional[np.ndarray] = ep_data.get("ref_actions")
+            phase_embeddings: Optional[dict] = ep_data.get("phase_embeddings")
+            phase_ref_actions: Optional[dict] = ep_data.get("phase_ref_actions")
 
-            # Goal = final TCP xyz of this successful episode
-            goal_pos = props[-1, 0:3]  # (3,)
+            # Goal pose: fixed port frame if configured, else demo endpoint
+            if fixed_port_pos is not None:
+                goal_pos = fixed_port_pos
+                goal_quat = fixed_port_quat
+            else:
+                goal_pos = props[-1, 0:3].astype(np.float64)
+                goal_quat = props[-1, 3:7].astype(np.float64)
 
-            # Batch-encode all frames → z_rl (T, D_rl)
+            # Infer phases early — needed to select phase-matched embeddings.
+            phases = _infer_phases(props, goal_pos, goal_quat, rcfg)
+            has_phase_embs = (phase_embeddings is not None
+                              and all(n in phase_embeddings for n in PHASE_NAMES))
+
+            # Batch-encode all frames → z_rl (T, D_rl).
+            # When phase embeddings are available, each frame uses the
+            # embedding extracted with its phase-matched prompt.
+            if has_phase_embs:
+                # Build a per-frame embedding tensor by picking the right
+                # phase variant for each frame.
+                mixed_embs = torch.empty_like(embeddings)
+                for t in range(T):
+                    pname = PHASE_NAMES[phases[t]]
+                    mixed_embs[t] = phase_embeddings[pname][t]
+                emb_source = mixed_embs
+                n_phase_matched += 1
+            else:
+                emb_source = embeddings
+
             z_rls_list = []
             for t0 in range(0, T, encode_batch):
                 t1 = min(t0 + encode_batch, T)
-                emb_batch = embeddings[t0:t1].to(self.device)  # (B, N, D)
+                emb_batch = emb_source[t0:t1].to(self.device)  # (B, N, D)
                 with torch.no_grad():
                     _, z_rl_batch = self.rl_token_model.encode(emb_batch)  # (B, D_rl)
                 z_rls_list.append(z_rl_batch.cpu().numpy())
             z_rls = np.concatenate(z_rls_list, axis=0)  # (T, D_rl)
 
-            # Add one transition per valid chunk start
+            # Per-frame rewards (phases already inferred above for embedding selection)
+            if rcfg.mode == "structured":
+                rewards = _compute_structured_reward(
+                    props, goal_pos, goal_quat, phases, rcfg
+                )
+            else:  # "legacy": original position-only Gaussian
+                d2 = np.sum((props[:, 0:3] - goal_pos) ** 2, axis=1)
+                rewards = np.exp(-d2 / (rcfg.sigma_pos ** 2)).astype(np.float32)
+
+            # C-step discounted return per chunk start
+            gamma = float(self.config.gamma)
+            chunk_returns = np.zeros(T, dtype=np.float32)
+            for t in range(T):
+                g = 1.0
+                R = 0.0
+                for k in range(C):
+                    tt = min(t + k, T - 1)
+                    R += g * float(rewards[tt])
+                    g *= gamma
+                chunk_returns[t] = R
+
+            if ref_actions_ep is not None:
+                n_with_ref += 1
+            else:
+                n_without_ref += 1
+
+            has_phase_refs = (phase_ref_actions is not None
+                              and all(n in phase_ref_actions for n in PHASE_NAMES))
+
             n_added = 0
             for t in range(T - C + 1):
-                pos_t = props[t, 0:3]
-                dist = np.linalg.norm(pos_t - goal_pos)
-                reward = float(np.exp(-(dist ** 2) / (reward_sigma ** 2)))
-
-                action_chunk = actions[t : t + C]          # (C, 7)
+                action_chunk = actions[t : t + C]
+                # Pick reference: phase-matched > default VLA > demo copy
+                if has_phase_refs:
+                    pname = PHASE_NAMES[phases[t]]
+                    ref_chunk = phase_ref_actions[pname][t]
+                elif ref_actions_ep is not None:
+                    ref_chunk = ref_actions_ep[t]
+                else:
+                    ref_chunk = action_chunk.copy()
                 t_next = min(t + 1, T - 1)
-                done = float(t == T - C)                   # 1.0 at last valid chunk
+                done = float(t == T - C)
 
-                self.replay_buffer.add(Transition(
+                pending.append((Transition(
                     z_rl=z_rls[t],
                     prop=props[t],
                     action_chunk=action_chunk,
-                    ref_action_chunk=action_chunk.copy(),  # demo action = reference
-                    reward=reward,
+                    ref_action_chunk=ref_chunk,
+                    reward=float(chunk_returns[t]),
                     next_z_rl=z_rls[t_next],
                     next_prop=props[t_next],
                     done=done,
-                ))
+                ), ep_idx))
                 n_added += 1
 
-            logger.info(f"  Episode {ep_idx:03d}: {T} frames → {n_added} transitions added")
+            ph_counts = [int(np.sum(phases == p)) for p in range(4)]
+            logger.info(
+                "  Episode %03d: T=%d, transitions=%d, phases=%s (appr/align/insert/verify), "
+                "reward min/mean/max=%.3f/%.3f/%.3f",
+                ep_idx, T, n_added, ph_counts,
+                float(rewards.min()), float(rewards.mean()), float(rewards.max()),
+            )
+
+        # Pass 2: normalize rewards and commit to replay buffer.
+        raw_rewards = np.array([tr.reward for tr, _ in pending], dtype=np.float32)
+        if rcfg.normalize and len(raw_rewards) > 1:
+            r_mean = float(raw_rewards.mean())
+            r_std = float(raw_rewards.std())
+            if r_std < 1e-8:
+                r_std = 1.0
+            logger.info(
+                "Reward normalization: mean=%.3f std=%.3f → shifting to zero mean, unit std",
+                r_mean, r_std,
+            )
+            normed_rewards = (raw_rewards - r_mean) / r_std
+        else:
+            normed_rewards = raw_rewards
+
+        for i, (tr, _ep) in enumerate(pending):
+            tr.reward = float(normed_rewards[i])
+            self.replay_buffer.add(tr)
+
+        logger.info(
+            "Replay reward stats over %d transitions (after normalization=%s): "
+            "min=%.3f p50=%.3f mean=%.3f p95=%.3f max=%.3f",
+            len(normed_rewards), rcfg.normalize,
+            float(normed_rewards.min()), float(np.median(normed_rewards)),
+            float(normed_rewards.mean()), float(np.percentile(normed_rewards, 95)),
+            float(normed_rewards.max()),
+        )
+        n_total_eps = n_with_ref + n_without_ref
+        if n_without_ref > 0:
+            logger.warning(
+                "Phase 2: %d/%d episodes have NO pre-extracted VLA ref_actions; "
+                "falling back to demo actions as the reference.",
+                n_without_ref, n_total_eps,
+            )
+        else:
+            logger.info(
+                "Phase 2: using pre-extracted VLA ref_actions for all %d episodes.",
+                n_with_ref,
+            )
+        if n_phase_matched > 0:
+            logger.info(
+                "Phase 2: %d/%d episodes used phase-matched embeddings+refs "
+                "(approach/align/insert/verify prompts).",
+                n_phase_matched, n_total_eps,
+            )
+        else:
+            logger.info(
+                "Phase 2: no phase-conditioned embeddings found; using single-prompt "
+                "embeddings. Re-run prepare_embeddings.py --extract_phase_prompts to fix."
+            )
 
     def pretrain_rl_token(self, demo_dataset: "torch.utils.data.Dataset") -> None:
         """Train RL token encoder-decoder on demonstration data (equation (2)).

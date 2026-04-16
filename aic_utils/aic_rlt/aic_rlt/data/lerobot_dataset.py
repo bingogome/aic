@@ -120,10 +120,64 @@ class LeRobotEmbeddingDataset(Dataset):
                 )
                 continue
 
+            # Optional: pre-extracted VLA reference action chunks (T, C, 7).
+            # If present, Phase 2 offline RL will use these as ref_action_chunk
+            # instead of copying demo actions, closing the train/deploy gap.
+            ref_actions = emb_data.get("ref_actions", None)
+            if ref_actions is not None:
+                if ref_actions.shape[0] != T:
+                    logger.warning(
+                        f"Episode {ep_idx}: ref_actions frames ({ref_actions.shape[0]}) "
+                        f"≠ parquet frames ({T}) — dropping ref_actions for this ep"
+                    )
+                    ref_actions = None
+                elif ref_actions.shape[1] != self.chunk_length:
+                    logger.warning(
+                        f"Episode {ep_idx}: ref_actions chunk_length "
+                        f"({ref_actions.shape[1]}) ≠ dataset chunk_length "
+                        f"({self.chunk_length}) — dropping ref_actions"
+                    )
+                    ref_actions = None
+                else:
+                    ref_actions = ref_actions.float().numpy()
+
+            # Phase-conditioned embeddings: dict name→Tensor(T, N, D)
+            phase_embeddings = emb_data.get("phase_embeddings", None)
+            if phase_embeddings is not None:
+                valid = True
+                for pname, pemb in phase_embeddings.items():
+                    if pemb.shape[0] != T:
+                        logger.warning(
+                            f"Episode {ep_idx}: phase_embeddings[{pname}] T "
+                            f"mismatch ({pemb.shape[0]} vs {T}) — dropping"
+                        )
+                        valid = False
+                        break
+                if not valid:
+                    phase_embeddings = None
+
+            phase_ref_actions = emb_data.get("phase_ref_actions", None)
+            if phase_ref_actions is not None:
+                for pname, pref in phase_ref_actions.items():
+                    if pref.shape[0] != T or pref.shape[1] != self.chunk_length:
+                        logger.warning(
+                            f"Episode {ep_idx}: phase_ref_actions[{pname}] "
+                            f"shape mismatch — dropping"
+                        )
+                        phase_ref_actions = None
+                        break
+                if phase_ref_actions is not None:
+                    phase_ref_actions = {
+                        k: v.float().numpy() for k, v in phase_ref_actions.items()
+                    }
+
             self._episodes[ep_idx] = {
                 "props": props,
                 "actions": actions,
                 "embeddings": embeddings,
+                "ref_actions": ref_actions,
+                "phase_embeddings": phase_embeddings,
+                "phase_ref_actions": phase_ref_actions,
                 "T": T,
             }
 

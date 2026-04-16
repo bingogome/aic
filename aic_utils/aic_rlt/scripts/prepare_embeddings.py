@@ -50,6 +50,7 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from aic_rlt.vla.xvla_wrapper import XVLAWrapper
+from aic_rlt.trainer import PHASE_NAMES, DEFAULT_PHASE_PROMPTS
 
 logging.basicConfig(
     level=logging.INFO,
@@ -75,23 +76,27 @@ def load_episode_frames(parquet_files, episode_index: int, camera: str):
     Returns:
         frames: list of dicts sorted by frame_index, each with:
             - frame_index (int)
-            - image (bytes)
+            - image_bytes (bytes)
+            - prop (np.ndarray, 26D) — observation.state
     """
     img_col = f"observation.images.{camera}"
     rows = []
 
     for pf in parquet_files:
-        table = pq.read_table(pf, columns=["episode_index", "frame_index", img_col])
+        table = pq.read_table(
+            pf,
+            columns=["episode_index", "frame_index", img_col, "observation.state"],
+        )
         d = table.to_pydict()
         n = len(d["episode_index"])
         for i in range(n):
             if int(d["episode_index"][i]) == episode_index:
                 img_entry = d[img_col][i]
-                # pyarrow stores struct<bytes,path>; extract bytes field
                 img_bytes = img_entry["bytes"] if isinstance(img_entry, dict) else img_entry
                 rows.append({
                     "frame_index": int(d["frame_index"][i]),
                     "image_bytes": img_bytes,
+                    "prop": np.array(d["observation.state"][i], dtype=np.float32),
                 })
 
     rows.sort(key=lambda r: r["frame_index"])
@@ -124,10 +129,23 @@ def parse_args():
                         help="Frames per forward pass (default: 8)")
     parser.add_argument("--image_size", type=int, default=256,
                         help="Resize images to this size (default: 256)")
+    parser.add_argument("--chunk_length", type=int, default=10,
+                        help="VLA reference action chunk length")
+    parser.add_argument("--extract_ref_actions", action="store_true", default=True,
+                        help="Also extract per-frame VLA action chunks so Phase 2 "
+                             "offline RL sees the same reference distribution as deploy")
+    parser.add_argument("--no_ref_actions", dest="extract_ref_actions",
+                        action="store_false")
+    parser.add_argument("--extract_phase_prompts", action="store_true", default=False,
+                        help="Extract embeddings+ref_actions for all 4 phase prompts "
+                             "(approach/align/insert/verify) in addition to the main "
+                             "instruction. Enables phase-matched training. ~4× slower.")
     parser.add_argument("--device", type=str,
                         default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--overwrite", action="store_true",
                         help="Re-extract even if output file already exists")
+    parser.add_argument("--max_episodes", type=int, default=0,
+                        help="If >0, process only the first N episodes (smoke-test).")
     return parser.parse_args()
 
 
@@ -144,6 +162,7 @@ def main():
             device=device,
             instruction=args.instruction,
             image_size=args.image_size,
+            chunk_length=args.chunk_length,
         )
     elif args.backend == "pi05":
         from aic_rlt.vla.pi05_backend import Pi05Backend
@@ -170,6 +189,9 @@ def main():
         for ep in table["episode_index"].to_pylist():
             episode_indices.add(int(ep))
     episode_indices = sorted(episode_indices)
+    if args.max_episodes and args.max_episodes > 0:
+        episode_indices = episode_indices[: args.max_episodes]
+        logger.info(f"--max_episodes={args.max_episodes}: limited to {episode_indices}")
     logger.info(f"Found {len(episode_indices)} episodes: {episode_indices[:5]} ...")
 
     # Process each episode
@@ -187,6 +209,13 @@ def main():
 
         T = len(frames)
         all_embeddings = []
+        all_ref_actions = []  # (T, chunk_length, 7) for xvla when extract_ref_actions
+        want_ref = args.extract_ref_actions and args.backend == "xvla"
+        if args.extract_ref_actions and args.backend != "xvla":
+            logger.warning(
+                "extract_ref_actions is only wired for backend=xvla; "
+                "skipping ref-action extraction for backend=%s", args.backend,
+            )
 
         # Process in batches
         for batch_start in range(0, T, args.batch_size):
@@ -196,9 +225,12 @@ def main():
 
             batch_embs = []
             if args.backend == "xvla":
-                for img_np in batch_imgs:
+                for img_np, frame in zip(batch_imgs, batch_frames):
                     emb = vla.get_embeddings(img_np)   # (num_tokens, embed_dim)
                     batch_embs.append(emb)
+                    if want_ref:
+                        ref = vla.get_action_chunk(img_np, frame["prop"])  # (C, 7)
+                        all_ref_actions.append(ref)
             elif args.backend == "pi05":
                 import jax
                 import jax.numpy as jnp
@@ -230,7 +262,50 @@ def main():
                 logger.info(f"    {batch_start}/{T} frames processed")
 
         embeddings = torch.stack(all_embeddings, dim=0)   # (T, num_tokens, 1024)
-        torch.save({"vla_embeddings": embeddings}, out_path)
+        out_blob = {"vla_embeddings": embeddings}
+        if want_ref and all_ref_actions:
+            ref_actions = torch.from_numpy(
+                np.stack(all_ref_actions, axis=0)
+            ).float()                                      # (T, chunk_length, 7)
+            out_blob["ref_actions"] = ref_actions
+            out_blob["ref_instruction"] = args.instruction
+            logger.info(
+                f"  Episode {ep_idx:04d}: ref_actions {tuple(ref_actions.shape)}"
+            )
+
+        # Phase-conditioned embeddings + ref_actions (4 prompts × T frames)
+        if args.extract_phase_prompts and args.backend == "xvla":
+            phase_embs = {}   # name → Tensor(T, N, D)
+            phase_refs = {}   # name → Tensor(T, C, 7)
+            for phase_id, phase_name in enumerate(PHASE_NAMES):
+                prompt = DEFAULT_PHASE_PROMPTS[phase_id]
+                vla.set_instruction(prompt)
+                p_embs = []
+                p_refs = []
+                for batch_start in range(0, T, args.batch_size):
+                    batch_frames = frames[batch_start : batch_start + args.batch_size]
+                    batch_imgs = [decode_image(f["image_bytes"], args.image_size)
+                                  for f in batch_frames]
+                    for img_np, frame in zip(batch_imgs, batch_frames):
+                        p_embs.append(vla.get_embeddings(img_np))
+                        if want_ref:
+                            p_refs.append(vla.get_action_chunk(img_np, frame["prop"]))
+                phase_embs[phase_name] = torch.stack(p_embs, dim=0)
+                if want_ref and p_refs:
+                    phase_refs[phase_name] = torch.from_numpy(
+                        np.stack(p_refs, axis=0)
+                    ).float()
+                logger.info(
+                    f"  Episode {ep_idx:04d}: phase '{phase_name}' embeddings extracted"
+                )
+            # Restore default instruction
+            vla.set_instruction(args.instruction)
+            out_blob["phase_embeddings"] = phase_embs
+            out_blob["phase_prompts"] = list(DEFAULT_PHASE_PROMPTS)
+            if phase_refs:
+                out_blob["phase_ref_actions"] = phase_refs
+
+        torch.save(out_blob, out_path)
         logger.info(f"  Episode {ep_idx:04d}: saved {embeddings.shape} → {out_path}")
 
     logger.info("Embedding extraction complete.")

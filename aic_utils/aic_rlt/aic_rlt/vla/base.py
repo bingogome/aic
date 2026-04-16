@@ -66,6 +66,16 @@ class VLABackend(ABC):
             np.ndarray of shape (chunk_length, action_dim), float32.
         """
 
+    def set_instruction(self, instruction: str) -> None:
+        """Swap the active language prompt (e.g. for phase-conditioned RLT).
+
+        Default is a no-op so backends that don't support runtime prompt
+        switching don't break. Backends that cache tokenized prompts should
+        override this to re-tokenize and update their internal state.
+        """
+        # no-op default
+        return None
+
     def get_embeddings_and_actions(self, obs) -> tuple:
         """Get embeddings and action chunk in one call.
 
