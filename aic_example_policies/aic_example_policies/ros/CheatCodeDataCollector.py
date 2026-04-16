@@ -67,6 +67,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import pandas as pd
+import yaml
 
 from aic_control_interfaces.msg import MotionUpdate
 from aic_model.policy import (
@@ -76,6 +77,7 @@ from aic_model.policy import (
 )
 from aic_model_interfaces.msg import Observation
 from aic_task_interfaces.msg import Task
+from rclpy.time import Time
 
 from .CheatCode import CheatCode
 
@@ -163,6 +165,68 @@ class CheatCodeDataCollector(CheatCode):
     # Policy entry point
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Ground-truth scoring helpers
+    # ------------------------------------------------------------------
+
+    def _lookup_plug_port_distance(self, task: Task) -> dict:
+        """Look up ground-truth plug and port poses via /scoring/tf and
+        return per-step scoring signals.  Returns empty dict on failure."""
+        try:
+            port_frame = f"task_board/{task.target_module_name}/{task.port_name}_link"
+            plug_frame = f"{task.cable_name}/{task.plug_name}_link"
+            port_tf = self._parent_node._tf_buffer.lookup_transform(
+                "base_link", port_frame, Time(),
+            )
+            plug_tf = self._parent_node._tf_buffer.lookup_transform(
+                "base_link", plug_frame, Time(),
+            )
+            pp = port_tf.transform.translation
+            pl = plug_tf.transform.translation
+            port_pos = np.array([pp.x, pp.y, pp.z], dtype=np.float32)
+            plug_pos = np.array([pl.x, pl.y, pl.z], dtype=np.float32)
+            dist = float(np.linalg.norm(plug_pos - port_pos))
+            pq = port_tf.transform.rotation
+            port_quat = np.array([pq.x, pq.y, pq.z, pq.w], dtype=np.float32)
+            return {
+                "plug_pos": plug_pos,
+                "port_pos": port_pos,
+                "port_quat": port_quat,
+                "plug_port_dist": dist,
+            }
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _read_latest_trial_score() -> dict:
+        """Try to read the most recent trial score from scoring.yaml.
+        Returns empty dict if unavailable."""
+        results_dir = os.environ.get("AIC_RESULTS_DIR",
+                                      str(Path.home() / "aic_results"))
+        score_path = Path(results_dir) / "scoring.yaml"
+        if not score_path.exists():
+            return {}
+        try:
+            with open(score_path) as f:
+                data = yaml.safe_load(f)
+            # Find the highest-numbered trial (most recent).
+            trial_keys = [k for k in data if k.startswith("trial_")]
+            if not trial_keys:
+                return {}
+            latest = max(trial_keys, key=lambda k: int(k.split("_")[1]))
+            t = data[latest]
+            return {
+                "tier1": t.get("tier_1", {}).get("score", 0),
+                "tier2": t.get("tier_2", {}).get("score", 0),
+                "tier3": t.get("tier_3", {}).get("score", 0),
+                "total": (t.get("tier_1", {}).get("score", 0)
+                          + t.get("tier_2", {}).get("score", 0)
+                          + t.get("tier_3", {}).get("score", 0)),
+                "trial_key": latest,
+            }
+        except Exception:
+            return {}
+
     def insert_cable(
         self,
         task: Task,
@@ -172,6 +236,7 @@ class CheatCodeDataCollector(CheatCode):
     ) -> bool:
         episode_id = str(uuid.uuid4())[:8]
         steps: list[dict] = []
+
         def recording_get_observation() -> Observation:
             return get_observation()
 
@@ -179,27 +244,28 @@ class CheatCodeDataCollector(CheatCode):
             motion_update: MotionUpdate = None,
             joint_motion_update=None,
         ) -> None:
-            # CheatCode drives purely from TF — it never calls get_observation().
-            # Fetch the observation here so every pose command is paired with
-            # the state the robot was in when that command was issued.
             if motion_update is not None:
                 obs = get_observation()
                 if obs is not None:
-                    steps.append(
-                        {
-                            "timestamp": time.time(),
-                            "state": _obs_to_state(obs),
-                            "action": _motion_to_action(motion_update),
-                            "images": {
-                                key: _ros_image_to_numpy(
-                                    getattr(obs, ros_attr), _IMAGE_SCALE
-                                )
-                                for key, ros_attr in zip(
-                                    _CAMERA_KEYS, _CAMERA_ROS_ATTRS
-                                )
-                            },
-                        }
-                    )
+                    step_data = {
+                        "timestamp": time.time(),
+                        "state": _obs_to_state(obs),
+                        "action": _motion_to_action(motion_update),
+                        "images": {
+                            key: _ros_image_to_numpy(
+                                getattr(obs, ros_attr), _IMAGE_SCALE
+                            )
+                            for key, ros_attr in zip(
+                                _CAMERA_KEYS, _CAMERA_ROS_ATTRS
+                            )
+                        },
+                    }
+                    gt = self._lookup_plug_port_distance(task)
+                    if gt:
+                        step_data["plug_port_dist"] = gt["plug_port_dist"]
+                        step_data["port_pos"] = gt["port_pos"]
+                        step_data["port_quat"] = gt["port_quat"]
+                    steps.append(step_data)
             move_robot(
                 motion_update=motion_update,
                 joint_motion_update=joint_motion_update,
@@ -212,8 +278,17 @@ class CheatCodeDataCollector(CheatCode):
             send_feedback,
         )
 
+        # Try to capture the eval score for this trial.
+        trial_score = self._read_latest_trial_score()
+        if trial_score:
+            self.get_logger().info(
+                f"Captured eval score: {trial_score.get('total', '?')} "
+                f"(tier3={trial_score.get('tier3', '?')})"
+            )
+
         if steps:
-            self._save_episode(episode_id, task, steps, success)
+            self._save_episode(episode_id, task, steps, success,
+                               trial_score=trial_score)
         else:
             self.get_logger().warn("No steps recorded — episode not saved.")
 
@@ -229,6 +304,7 @@ class CheatCodeDataCollector(CheatCode):
         task: Task,
         steps: list[dict],
         success: bool,
+        trial_score: dict | None = None,
     ) -> None:
         n = len(steps)
         self.get_logger().info(
@@ -262,10 +338,21 @@ class CheatCodeDataCollector(CheatCode):
                     for k in _CAMERA_KEYS
                 },
             }
+            if "plug_port_dist" in step:
+                row["plug_port_dist"] = step["plug_port_dist"]
             rows.append(row)
 
         df = pd.DataFrame(rows)
         df.to_parquet(ep_dir / "data.parquet", index=False)
+
+        # Ground-truth port pose from first step (constant across episode)
+        port_pos_list = None
+        port_quat_list = None
+        for step in steps:
+            if "port_pos" in step:
+                port_pos_list = step["port_pos"].tolist()
+                port_quat_list = step["port_quat"].tolist()
+                break
 
         # episode metadata
         meta = {
@@ -285,6 +372,11 @@ class CheatCodeDataCollector(CheatCode):
             "cameras": _CAMERA_KEYS,
             "image_scale": _IMAGE_SCALE,
         }
+        if port_pos_list is not None:
+            meta["port_pos"] = port_pos_list
+            meta["port_quat"] = port_quat_list
+        if trial_score:
+            meta["eval_score"] = trial_score
         with open(ep_dir / "meta.json", "w") as f:
             json.dump(meta, f, indent=2)
 
