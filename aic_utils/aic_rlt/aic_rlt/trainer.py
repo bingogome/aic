@@ -202,12 +202,6 @@ def _quat_xyzw_to_mat(q: np.ndarray) -> np.ndarray:
     )
 
 
-def _quat_dot_abs(q1: np.ndarray, q2: np.ndarray) -> float:
-    """|q1 · q2| — orientation similarity, 1.0 means identical up to sign."""
-    d = float(np.dot(q1, q2))
-    return abs(d)
-
-
 def _infer_phases(
     props: np.ndarray,
     goal_pos: np.ndarray,
@@ -233,21 +227,21 @@ def _infer_phases(
     R_port = _quat_xyzw_to_mat(goal_quat)
     port_axis = R_port[:, rcfg.port_insert_axis]  # world-frame unit vec
     contact_lo = float(rcfg.contact_axial_band[0])
-    for t in range(T):
-        d = float(np.linalg.norm(props[t, 0:3] - goal_pos))
-        o_err = 1.0 - _quat_dot_abs(props[t, 3:7], goal_quat)
-        axial_err = abs(float(np.dot(props[t, 13:16], port_axis)))
-        if d <= rcfg.d_verify_thresh:
-            phases[t] = PHASE_VERIFY
-        elif d <= rcfg.d_align_thresh:
-            # Inside the alignment ball: align until orientation locked AND we
-            # feel axial contact. Without both signals, we're still aligning.
-            if o_err <= rcfg.ori_align_thresh and axial_err > contact_lo:
-                phases[t] = PHASE_INSERT
-            else:
-                phases[t] = PHASE_ALIGN
-        else:
-            phases[t] = PHASE_APPROACH
+
+    d = np.linalg.norm(props[:, 0:3] - goal_pos, axis=1)         # (T,)
+    o_err = 1.0 - np.abs(props[:, 3:7] @ goal_quat)              # (T,)
+    axial_err = np.abs(props[:, 13:16] @ port_axis)               # (T,)
+
+    # Order matters: later assignments overwrite earlier ones.
+    align_mask = d <= rcfg.d_align_thresh
+    phases[align_mask] = PHASE_ALIGN
+
+    insert_mask = align_mask & (o_err <= rcfg.ori_align_thresh) & (axial_err > contact_lo)
+    phases[insert_mask] = PHASE_INSERT
+
+    verify_mask = d <= rcfg.d_verify_thresh
+    phases[verify_mask] = PHASE_VERIFY
+
     return phases
 
 
@@ -261,56 +255,49 @@ def _compute_structured_reward(
     """Per-frame scalar reward combining position, orientation, insertion
     depth, contact band, and phase-transition bonuses."""
     T = props.shape[0]
-    rewards = np.zeros(T, dtype=np.float32)
-
-    # Port z-axis in world frame (for depth term). If goal_quat is the port
-    # frame, its insert axis is a column of R(q_goal).
     R_port = _quat_xyzw_to_mat(goal_quat)
     port_axis = R_port[:, rcfg.port_insert_axis]  # (3,) world-frame unit vec
 
-    for t in range(T):
-        pos = props[t, 0:3]
-        quat = props[t, 3:7]
-        err = props[t, 13:16]  # controller pose error (proxy for contact)
+    pos = props[:, 0:3]       # (T, 3)
+    quat = props[:, 3:7]      # (T, 4)
+    err = props[:, 13:16]     # (T, 3) controller pose error (proxy for contact)
 
-        # 1. Position Gaussian → [0, 1]
-        d = float(np.linalg.norm(pos - goal_pos))
-        r_pos = float(np.exp(-(d ** 2) / (rcfg.sigma_pos ** 2)))
+    # 1. Position Gaussian → [0, 1]
+    d = np.linalg.norm(pos - goal_pos, axis=1)
+    r_pos = np.exp(-(d ** 2) / (rcfg.sigma_pos ** 2))
 
-        # 2. Orientation alignment → [0, 1]
-        r_ori = _quat_dot_abs(quat, goal_quat)
+    # 2. Orientation alignment → [0, 1]
+    r_ori = np.abs(quat @ goal_quat)
 
-        # 3. Insertion depth ramp → [0, 1] as TCP projects past port along axis
-        proj = float(np.dot(pos - goal_pos, port_axis))
-        # Before port (proj > 0 going away): 0. Inside (proj in [-depth, 0]): ramp.
-        depth_norm = np.clip(-proj / max(rcfg.insert_depth_m, 1e-6), 0.0, 1.0)
-        r_depth = float(depth_norm)
+    # 3. Insertion depth ramp → [0, 1]
+    proj = (pos - goal_pos) @ port_axis
+    r_depth = np.clip(-proj / max(rcfg.insert_depth_m, 1e-6), 0.0, 1.0)
 
-        # 4. Contact term: proxy via tcp_err. Axial err in band → +1; lateral → penalty.
-        axial_err = abs(float(np.dot(err, port_axis)))
-        lateral_err = float(np.linalg.norm(err - np.dot(err, port_axis) * port_axis))
-        lo, hi = rcfg.contact_axial_band
-        axial_in_band = 1.0 if (lo <= axial_err <= hi) else 0.0
-        r_contact = axial_in_band - lateral_err / max(rcfg.contact_lateral_scale, 1e-6)
-        r_contact = float(np.clip(r_contact, -1.0, 1.0))
+    # 4. Contact term
+    axial_scalar = err @ port_axis                                # (T,)
+    axial_err = np.abs(axial_scalar)
+    lateral_vec = err - np.outer(axial_scalar, port_axis)         # (T, 3)
+    lateral_err = np.linalg.norm(lateral_vec, axis=1)
+    lo, hi = rcfg.contact_axial_band
+    axial_in_band = ((axial_err >= lo) & (axial_err <= hi)).astype(np.float32)
+    r_contact = np.clip(
+        axial_in_band - lateral_err / max(rcfg.contact_lateral_scale, 1e-6),
+        -1.0, 1.0,
+    )
 
-        # Assemble weighted sum
-        r = (
-            rcfg.w_pos * r_pos
-            + rcfg.w_ori * r_ori
-            + rcfg.w_depth * r_depth
-            + rcfg.w_contact * r_contact
-        )
+    # Weighted sum
+    rewards = (rcfg.w_pos * r_pos
+               + rcfg.w_ori * r_ori
+               + rcfg.w_depth * r_depth
+               + rcfg.w_contact * r_contact).astype(np.float32)
 
-        # 5. Sparse phase-transition bonus (once, at the frame the phase advances)
-        if t > 0 and phases[t] > phases[t - 1]:
-            r += rcfg.w_phase_bonus
+    # 5. Sparse phase-transition bonus
+    phase_advanced = np.zeros(T, dtype=np.float32)
+    phase_advanced[1:] = (phases[1:] > phases[:-1]).astype(np.float32)
+    rewards += rcfg.w_phase_bonus * phase_advanced
 
-        # 6. Success bonus on verify
-        if phases[t] == PHASE_VERIFY:
-            r += rcfg.w_success
-
-        rewards[t] = r
+    # 6. Success bonus on verify
+    rewards += rcfg.w_success * (phases == PHASE_VERIFY).astype(np.float32)
 
     return rewards
 
@@ -504,6 +491,26 @@ class RLTTrainer:
         C = self.config.actor_critic.chunk_length
         encode_batch = 64  # frames per GPU batch for encoding
         rcfg = self.config.reward
+
+        # Auto-size replay buffer so all demo transitions fit.
+        total_transitions = sum(
+            max(ep["T"] - C + 1, 0) for ep in demo_dataset._episodes.values()
+        )
+        needed = int(max(total_transitions * 1.1, self.replay_buffer.capacity))
+        if needed > self.replay_buffer.capacity:
+            logger.info(
+                "Resizing replay buffer: %d → %d (dataset has %d transitions)",
+                self.replay_buffer.capacity, needed, total_transitions,
+            )
+            cfg = self.config.actor_critic
+            self.replay_buffer = ReplayBuffer(
+                capacity=needed,
+                rl_token_dim=cfg.rl_token_dim,
+                prop_dim=cfg.prop_dim,
+                action_dim=cfg.action_dim,
+                chunk_length=cfg.chunk_length,
+                device=self.device,
+            )
 
         # Resolve port-frame goal (shared across episodes, if provided).
         fixed_port_pos: Optional[np.ndarray] = None
