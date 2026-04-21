@@ -23,8 +23,9 @@ All VLA backends must accept AIC ROS Observation messages and return:
 Backends also expose:
   - embed_dim:   int   (per-token embedding dimensionality)
   - num_tokens:  int   (number of tokens per observation)
+  - action_dim:  int   (dimensionality of actions the backend emits)
 
-These dimensions are used to construct RLTokenConfig at init time.
+These dimensions are used to construct RLTokenConfig / ActorCriticConfig.
 """
 
 from abc import ABC, abstractmethod
@@ -43,6 +44,7 @@ class VLABackend(ABC):
     # Subclasses must set these after the model is loaded.
     embed_dim: int
     num_tokens: int
+    action_dim: int
 
     @abstractmethod
     def get_embeddings(self, obs) -> torch.Tensor:

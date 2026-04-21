@@ -24,8 +24,9 @@ an episode. The dataset yields:
     {
         "vla_embeddings": Tensor(num_tokens, embed_dim),  # single timestep
         "prop":           Tensor(26,),
-        "action_chunk":   Tensor(chunk_length, 7),
+        "action_chunk":   Tensor(chunk_length, action_dim),
     }
+action_dim depends on backend: 9 (xvla rot6d) or 7 (pi05 joint-space).
 """
 
 import logging
@@ -56,10 +57,12 @@ class LeRobotEmbeddingDataset(Dataset):
         data_dir: str,
         embeddings_dir: str,
         chunk_length: int = 10,
+        action_dim: int = 9,
     ):
         self.data_dir = Path(data_dir)
         self.embeddings_dir = Path(embeddings_dir)
         self.chunk_length = chunk_length
+        self.action_dim = action_dim
 
         self._samples: List[Dict] = []   # list of {ep_idx, frame_start}
         self._episodes: Dict[int, Dict] = {}  # ep_idx → {prop, actions, embeddings}
@@ -104,8 +107,14 @@ class LeRobotEmbeddingDataset(Dataset):
             T = len(rows)
 
             props = np.stack([r["prop"] for r in rows])     # (T, 26)
-            actions_quat = np.stack([r["action"] for r in rows])  # (T, 7)
-            actions = quat_actions_to_rot6d(actions_quat)         # (T, 9)
+            actions_raw = np.stack([r["action"] for r in rows])  # (T, 7) aic-native TCP+quat
+            # aic's demo actions are 7D TCP (xyz+quat). xvla training wants 9D rot6d;
+            # pi05 training wants pi0.5's 7D joint-space (supplied via ref_actions).
+            # Only convert when raw is 7D-TCP-quat AND target is 9D-rot6d (xvla path).
+            if actions_raw.shape[-1] == 7 and self.action_dim == 9:
+                actions = quat_actions_to_rot6d(actions_raw)   # (T, 9)
+            else:
+                actions = actions_raw                          # unchanged
 
             # Load pre-extracted embeddings
             emb_path = self.embeddings_dir / f"episode_{ep_idx:04d}.pt"
@@ -143,8 +152,10 @@ class LeRobotEmbeddingDataset(Dataset):
                     ref_actions = None
                 else:
                     ref_np = ref_actions.float().numpy()
-                    # Convert 7D quat ref_actions → 9D rot6d if needed
-                    if ref_np.shape[-1] == 7:
+                    # Only convert 7D quat → 9D rot6d when that's what the
+                    # actor expects (xvla path). pi05 stores 7D joint ref_actions
+                    # and wants them used as-is.
+                    if ref_np.shape[-1] == 7 and self.action_dim == 9:
                         ref_np = quat_actions_to_rot6d(ref_np)
                     ref_actions = ref_np
 
@@ -174,11 +185,12 @@ class LeRobotEmbeddingDataset(Dataset):
                         phase_ref_actions = None
                         break
                 if phase_ref_actions is not None:
-                    phase_ref_actions = {
-                        k: quat_actions_to_rot6d(v.float().numpy())
-                        if v.shape[-1] == 7 else v.float().numpy()
-                        for k, v in phase_ref_actions.items()
-                    }
+                    def _maybe_convert(v):
+                        arr = v.float().numpy()
+                        if arr.shape[-1] == 7 and self.action_dim == 9:
+                            return quat_actions_to_rot6d(arr)
+                        return arr
+                    phase_ref_actions = {k: _maybe_convert(v) for k, v in phase_ref_actions.items()}
 
             self._episodes[ep_idx] = {
                 "props": props,
