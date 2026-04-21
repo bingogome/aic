@@ -72,6 +72,35 @@ def decode_image(image_bytes: bytes, image_size: int) -> np.ndarray:
     return np.array(img, dtype=np.uint8)
 
 
+def _select_parquet_files_for_episode(parquet_files, episode_index: int):
+    """Narrow the file list to only those containing `episode_index`.
+
+    aic's LeRobot v3.0 dataset stores one episode per parquet (verified:
+    file-XXX.parquet contains episode XXX). If that convention holds,
+    we only read that one file instead of all 100 — ~100× faster.
+    We fall back to the full list if the convention doesn't match.
+    """
+    import pyarrow.parquet as _pq
+    # Fast path: filename pattern file-{NNN}.parquet matches episode NNN.
+    for pf in parquet_files:
+        stem = Path(pf).stem  # e.g. "file-007"
+        if stem.startswith("file-"):
+            try:
+                n = int(stem.split("-", 1)[1])
+            except (ValueError, IndexError):
+                continue
+            if n == episode_index:
+                # Sanity-check: read a tiny slice of episode_index column
+                # to confirm the convention holds for this dataset.
+                t = _pq.read_table(pf, columns=["episode_index"]).to_pydict()
+                uniq = set(int(x) for x in t["episode_index"])
+                if uniq == {episode_index}:
+                    return [pf]
+                # Convention violated — fall through to full scan.
+                break
+    return parquet_files
+
+
 def load_episode_frames(parquet_files, episode_index: int, cameras):
     """Load all frames for one episode from parquet files.
 
@@ -97,8 +126,9 @@ def load_episode_frames(parquet_files, episode_index: int, cameras):
     def _bytes(entry):
         return entry["bytes"] if isinstance(entry, dict) else entry
 
+    narrowed = _select_parquet_files_for_episode(parquet_files, episode_index)
     rows = []
-    for pf in parquet_files:
+    for pf in narrowed:
         table = pq.read_table(
             pf,
             columns=["episode_index", "frame_index", *img_cols, "observation.state"],

@@ -155,8 +155,15 @@ class Pi05Backend(VLABackend):
         base_config = openpi_config.get_config(self._openpi_config)
         from ._ur5_transforms import make_ur5_data_config_cls
         Pi05UR5DataConfig = make_ur5_data_config_cls()
+        # Point assets_dir at the checkpoint's own assets/ so the internal
+        # create_base_config doesn't warn about a missing norm_stats path
+        # derived from pi05_aloha's default train-time assets layout.
+        ckpt_assets_dir = str(Path(self._checkpoint_dir) / "assets")
         ur5_data_factory = Pi05UR5DataConfig(
-            assets=openpi_config.AssetsConfig(asset_id=self._asset_id),
+            assets=openpi_config.AssetsConfig(
+                assets_dir=ckpt_assets_dir,
+                asset_id=self._asset_id,
+            ),
         )
         train_config = dataclasses.replace(base_config, data=ur5_data_factory)
 
