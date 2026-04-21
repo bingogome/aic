@@ -1,0 +1,59 @@
+{
+  "os": "Linux-6.17.0-20-generic-x86_64-with-glibc2.39",
+  "python": "CPython 3.12.12",
+  "startedAt": "2026-04-20T19:25:30.757791Z",
+  "args": [
+    "--mode",
+    "offline_rl",
+    "--data_dir",
+    "/home/yifeng/aic_data_sym",
+    "--embeddings_dir",
+    "/home/yifeng/aic_data_sym/embeddings",
+    "--checkpoint_dir",
+    "/home/yifeng/aic/checkpoints/rlt_rot6d",
+    "--load_checkpoint",
+    "/home/yifeng/aic/checkpoints/rlt_full/phase1_rl_token.pt",
+    "--reward_mode",
+    "structured",
+    "--n_offline_epochs",
+    "500",
+    "--wandb",
+    "--wandb_run_name",
+    "offline_rot6d_bc0_500ep"
+  ],
+  "program": "/home/yifeng/aic/.claude/worktrees/yw_impedance-tuning/aic_utils/aic_rlt/scripts/train.py",
+  "codePath": "aic_utils/aic_rlt/scripts/train.py",
+  "codePathLocal": "aic_utils/aic_rlt/scripts/train.py",
+  "git": {
+    "remote": "git@github.com:sl628/aic.git",
+    "commit": "982ce078f97f4d041d437befbb6e44cb6bd0c1fe"
+  },
+  "email": "wuyifeng5@gmail.com",
+  "root": "/home/yifeng/aic/.claude/worktrees/yw_impedance-tuning",
+  "host": "Purrticle0",
+  "executable": "/home/yifeng/aic/.claude/worktrees/yw_impedance-tuning/.pixi/envs/default/bin/python",
+  "cpu_count": 8,
+  "cpu_count_logical": 16,
+  "gpu": "NVIDIA GeForce RTX 5080",
+  "gpu_count": 1,
+  "disk": {
+    "/": {
+      "total": "3935709487104",
+      "used": "609562902528"
+    }
+  },
+  "memory": {
+    "total": "134684672000"
+  },
+  "gpu_nvidia": [
+    {
+      "name": "NVIDIA GeForce RTX 5080",
+      "memoryTotal": "17094934528",
+      "cudaCores": 10752,
+      "architecture": "Blackwell",
+      "uuid": "GPU-c0bf4863-c479-cd39-7326-2de35cc5becd"
+    }
+  ],
+  "cudaVersion": "13.0",
+  "writerId": "xrz7su17s8ptomm165wk83bnftlez0s3"
+}

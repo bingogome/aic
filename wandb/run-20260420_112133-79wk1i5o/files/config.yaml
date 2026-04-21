@@ -1,0 +1,102 @@
+_wandb:
+    value:
+        cli_version: 0.24.2
+        e:
+            ybk2aui8wzefaerg6vjxd54kigdauuaw:
+                args:
+                    - --mode
+                    - offline_rl
+                    - --data_dir
+                    - /home/yifeng/aic_data_sym
+                    - --embeddings_dir
+                    - /home/yifeng/aic_data_sym/embeddings
+                    - --checkpoint_dir
+                    - /home/yifeng/aic/checkpoints/rlt_rot6d
+                    - --load_checkpoint
+                    - /home/yifeng/aic/checkpoints/rlt_full/phase1_rl_token.pt
+                    - --reward_mode
+                    - structured
+                    - --n_offline_epochs
+                    - "500"
+                    - --wandb
+                    - --wandb_run_name
+                    - offline_rot6d_bc50_500ep
+                codePath: aic_utils/aic_rlt/scripts/train.py
+                codePathLocal: aic_utils/aic_rlt/scripts/train.py
+                cpu_count: 8
+                cpu_count_logical: 16
+                cudaVersion: "13.0"
+                disk:
+                    /:
+                        total: "3935709487104"
+                        used: "606700670976"
+                email: wuyifeng5@gmail.com
+                executable: /home/yifeng/aic/.claude/worktrees/yw_impedance-tuning/.pixi/envs/default/bin/python
+                git:
+                    commit: 982ce078f97f4d041d437befbb6e44cb6bd0c1fe
+                    remote: git@github.com:sl628/aic.git
+                gpu: NVIDIA GeForce RTX 5080
+                gpu_count: 1
+                gpu_nvidia:
+                    - architecture: Blackwell
+                      cudaCores: 10752
+                      memoryTotal: "17094934528"
+                      name: NVIDIA GeForce RTX 5080
+                      uuid: GPU-c0bf4863-c479-cd39-7326-2de35cc5becd
+                host: Purrticle0
+                memory:
+                    total: "134684672000"
+                os: Linux-6.17.0-20-generic-x86_64-with-glibc2.39
+                program: /home/yifeng/aic/.claude/worktrees/yw_impedance-tuning/aic_utils/aic_rlt/scripts/train.py
+                python: CPython 3.12.12
+                root: /home/yifeng/aic/.claude/worktrees/yw_impedance-tuning
+                startedAt: "2026-04-20T18:21:33.425243Z"
+                writerId: ybk2aui8wzefaerg6vjxd54kigdauuaw
+        m: []
+        python_version: 3.12.12
+        t:
+            "1":
+                - 1
+                - 11
+                - 41
+                - 49
+                - 51
+                - 71
+            "2":
+                - 1
+                - 11
+                - 41
+                - 49
+                - 51
+                - 71
+            "3":
+                - 13
+                - 16
+                - 61
+            "4": 3.12.12
+            "5": 0.24.2
+            "6": 5.5.3
+            "12": 0.24.2
+            "13": linux-x86_64
+action_dim:
+    value: 9
+actor_lr:
+    value: 0.0003
+batch_size:
+    value: 256
+bc_coeff:
+    value: 50
+chunk_length:
+    value: 10
+critic_lr:
+    value: 0.0003
+gamma:
+    value: 0.99
+replay_buffer_capacity:
+    value: 200000
+reward_mode:
+    value: structured
+rl_token_dim:
+    value: 2048
+vla_embed_dim:
+    value: 1024

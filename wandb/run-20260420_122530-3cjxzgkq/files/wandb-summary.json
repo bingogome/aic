@@ -1,0 +1,1 @@
+{"_timestamp":1.776715045346992e+09,"phase2/step":305000,"phase2/actor_loss":-8.486177444458008,"phase2/epoch":500,"_step":305000,"phase2/replay_buffer_size":156300,"phase2/critic_loss":0.384753942489624,"_wandb":{"runtime":1917},"_runtime":1917.412593586}

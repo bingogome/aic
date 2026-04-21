@@ -155,7 +155,7 @@ class RLTConfig:
     # TD3 target network EMA coefficient
     tau: float = 0.005
     # BC regularizer coefficient β (equation (5))
-    bc_coeff: float = 5.0
+    bc_coeff: float = 0.0
     # TD3 target policy noise
     target_policy_noise: float = 0.2
     target_noise_clip: float = 0.5

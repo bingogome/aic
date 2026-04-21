@@ -212,7 +212,7 @@ def parse_args():
     parser.add_argument("--load_checkpoint", type=str, default="")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     # Hyperparameter overrides
-    parser.add_argument("--bc_coeff", type=float, default=5.0)
+    parser.add_argument("--bc_coeff", type=float, default=0.0)
     parser.add_argument("--n_warmup_steps", type=int, default=2000)
     parser.add_argument("--total_env_steps", type=int, default=50000)
     parser.add_argument("--hidden_dims", type=int, nargs="+", default=[256, 256])
