@@ -38,7 +38,9 @@ def check_one(pt_path: Path, ur5e_stats: dict | None) -> list[str]:
 
     emb = d["vla_embeddings"]
     if emb.ndim != 3:
-        errors.append(f"vla_embeddings ndim={emb.ndim}, expected 3 (T, num_tokens, embed_dim)")
+        errors.append(
+            f"vla_embeddings ndim={emb.ndim}, expected 3 (T, num_tokens, embed_dim)"
+        )
         return errors
 
     T = emb.shape[0]
@@ -57,7 +59,9 @@ def check_one(pt_path: Path, ur5e_stats: dict | None) -> list[str]:
         return errors
 
     if "action_dim" in d and int(d["action_dim"]) != int(ref.shape[-1]):
-        errors.append(f"action_dim field ({d['action_dim']}) != ref_actions last dim ({ref.shape[-1]})")
+        errors.append(
+            f"action_dim field ({d['action_dim']}) != ref_actions last dim ({ref.shape[-1]})"
+        )
 
     # The q01/q99 envelope check only makes sense for pi0.5's *delta* action space,
     # but our saved ref_actions are post-AbsoluteActions (absolute joints), so the
@@ -73,8 +77,11 @@ def check_one(pt_path: Path, ur5e_stats: dict | None) -> list[str]:
             lo = ref_np.reshape(-1, 7).min(0)
             hi = ref_np.reshape(-1, 7).max(0)
             width = q99 - q01 + 1e-6
-            out_dims = [i for i in range(7)
-                        if lo[i] < q01[i] - 0.5 * width[i] or hi[i] > q99[i] + 0.5 * width[i]]
+            out_dims = [
+                i
+                for i in range(7)
+                if lo[i] < q01[i] - 0.5 * width[i] or hi[i] > q99[i] + 0.5 * width[i]
+            ]
             if out_dims:
                 # This is informational, not a hard failure — aic's workspace differs
                 # from pi0.5's ur5e training distribution (OOD warning per plan risk #1).
@@ -106,19 +113,26 @@ def compare_instruction_dependence(dir_a: Path, dir_b: Path) -> list[str]:
     rel = num / max(denom, 1e-6)
     print(f"  instruction-dependence signal (relative Frobenius): {rel:.4f}")
     if rel < 1e-4:
-        errs.append(f"embeddings for '{dir_a.name}' and '{dir_b.name}' are effectively "
-                    f"identical (rel={rel:.2e}) — language ablation likely still present")
+        errs.append(
+            f"embeddings for '{dir_a.name}' and '{dir_b.name}' are effectively "
+            f"identical (rel={rel:.2e}) — language ablation likely still present"
+        )
     return errs
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--embeddings_dir", required=True)
-    ap.add_argument("--compare_dir", default=None,
-                    help="Second embeddings dir extracted with a different instruction "
-                         "(validation check #4 — embeddings should differ)")
-    ap.add_argument("--ur5e_norm_stats",
-                    default="/home/yifeng/workspace/pi05_base/pi05_base/assets/ur5e/norm_stats.json")
+    ap.add_argument(
+        "--compare_dir",
+        default=None,
+        help="Second embeddings dir extracted with a different instruction "
+        "(validation check #4 — embeddings should differ)",
+    )
+    ap.add_argument(
+        "--ur5e_norm_stats",
+        default="/home/yifeng/workspace/pi05_base/pi05_base/assets/ur5e/norm_stats.json",
+    )
     args = ap.parse_args()
 
     ur5e = None
@@ -146,11 +160,16 @@ def main():
         else:
             d = _load(pt)
             emb = d["vla_embeddings"]
-            ref_info = (f" ref_actions={tuple(d['ref_actions'].shape)}"
-                        if "ref_actions" in d else " [embeddings-only (Option B)]")
+            ref_info = (
+                f" ref_actions={tuple(d['ref_actions'].shape)}"
+                if "ref_actions" in d
+                else " [embeddings-only (Option B)]"
+            )
             instr = d.get("ref_instruction", d.get("instruction", "<not stored>"))
-            print(f"OK   {pt.name}: T={emb.shape[0]} tokens={emb.shape[1]} "
-                  f"embed_dim={emb.shape[2]}{ref_info} instr='{instr}'")
+            print(
+                f"OK   {pt.name}: T={emb.shape[0]} tokens={emb.shape[1]} "
+                f"embed_dim={emb.shape[2]}{ref_info} instr='{instr}'"
+            )
         for m in info:
             print(f"     {m}")
 

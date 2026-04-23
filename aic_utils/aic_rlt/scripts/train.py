@@ -247,10 +247,14 @@ def parse_args():
     parser.add_argument("--hidden_dims", type=int, nargs="+", default=[256, 256])
     parser.add_argument("--rl_token_epochs", type=int, default=50)
     parser.add_argument("--chunk_length", type=int, default=10)
-    parser.add_argument("--action_dim", type=int, default=None,
-                        help="Actor/critic action dim. If omitted, auto-detected "
-                             "from embeddings .pt (for phase1/offline) or backend "
-                             "(for online). Fail loud if auto-detection finds nothing.")
+    parser.add_argument(
+        "--action_dim",
+        type=int,
+        default=None,
+        help="Actor/critic action dim. If omitted, auto-detected "
+        "from embeddings .pt (for phase1/offline) or backend "
+        "(for online). Fail loud if auto-detection finds nothing.",
+    )
     # Phase 2 offline RL arguments
     parser.add_argument(
         "--n_offline_epochs",
@@ -408,8 +412,9 @@ def _detect_action_dim(embeddings_dir: str) -> Optional[int]:
     return None
 
 
-def _resolve_action_dim(args, embeddings_dir: Optional[str] = None,
-                         backend=None) -> int:
+def _resolve_action_dim(
+    args, embeddings_dir: Optional[str] = None, backend=None
+) -> int:
     """Resolve action_dim from (in order): CLI flag, backend, embeddings metadata.
 
     Raises if none of the sources can supply it.

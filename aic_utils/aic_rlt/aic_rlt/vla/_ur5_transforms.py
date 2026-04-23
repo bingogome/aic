@@ -35,11 +35,16 @@ class UR5Inputs:
     """Map UR5 (6 joints + 1 gripper, base+wrist cams) → pi0.5 observation."""
 
     EXPECTED_KEYS: ClassVar[tuple[str, ...]] = (
-        "joints", "gripper", "base_rgb", "wrist_rgb",
+        "joints",
+        "gripper",
+        "base_rgb",
+        "wrist_rgb",
     )
 
     def __call__(self, data: dict) -> dict:
-        state = np.concatenate([np.asarray(data["joints"]), np.asarray(data["gripper"])])
+        state = np.concatenate(
+            [np.asarray(data["joints"]), np.asarray(data["gripper"])]
+        )
         base_image = _parse_image(data["base_rgb"])
         wrist_image = _parse_image(data["wrist_rgb"])
 
@@ -105,7 +110,9 @@ def make_ur5_data_config_cls():
                 outputs=[UR5Outputs()],
             )
             if self.use_delta_joint_actions:
-                delta_action_mask = _transforms.make_bool_mask(6, -1)  # first 6 delta, gripper absolute
+                delta_action_mask = _transforms.make_bool_mask(
+                    6, -1
+                )  # first 6 delta, gripper absolute
                 data_transforms = data_transforms.push(
                     inputs=[_transforms.DeltaActions(delta_action_mask)],
                     outputs=[_transforms.AbsoluteActions(delta_action_mask)],

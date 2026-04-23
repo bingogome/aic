@@ -23,11 +23,14 @@ def _quat_wxyz_to_mat(qw: float, qx: float, qy: float, qz: float) -> np.ndarray:
     wx, wy, wz = s * qw * qx, s * qw * qy, s * qw * qz
     xx, xy, xz = s * qx * qx, s * qx * qy, s * qx * qz
     yy, yz, zz = s * qy * qy, s * qy * qz, s * qz * qz
-    R = np.array([
-        [1.0 - (yy + zz), xy - wz,          xz + wy],
-        [xy + wz,         1.0 - (xx + zz),  yz - wx],
-        [xz - wy,         yz + wx,          1.0 - (xx + yy)],
-    ], dtype=np.float64)
+    R = np.array(
+        [
+            [1.0 - (yy + zz), xy - wz, xz + wy],
+            [xy + wz, 1.0 - (xx + zz), yz - wx],
+            [xz - wy, yz + wx, 1.0 - (xx + yy)],
+        ],
+        dtype=np.float64,
+    )
     return R
 
 
