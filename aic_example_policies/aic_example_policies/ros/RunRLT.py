@@ -138,6 +138,8 @@ class RunRLT(Policy):
             ("policy_args.prompt_align", _PHASE_PROMPT_DEFAULTS["align"]),
             ("policy_args.prompt_insert", _PHASE_PROMPT_DEFAULTS["insert"]),
             ("policy_args.prompt_verify", _PHASE_PROMPT_DEFAULTS["verify"]),
+            # Debug: bypass actor and execute VLA reference actions directly.
+            ("policy_args.vla_only", False),
         ]
         for name, default in _params:
             try:
@@ -158,6 +160,12 @@ class RunRLT(Policy):
             "insert": parent_node.get_parameter("policy_args.prompt_insert").value,
             "verify": parent_node.get_parameter("policy_args.prompt_verify").value,
         }
+        self._vla_only = parent_node.get_parameter("policy_args.vla_only").value
+        if self._vla_only:
+            self.get_logger().info(
+                "VLA-only mode: bypassing actor, executing VLA refs directly"
+            )
+
         port_pose = list(
             parent_node.get_parameter("policy_args.port_pose_xyzquat").value
         )
@@ -405,6 +413,8 @@ class RunRLT(Policy):
 
     def _maybe_switch_prompt(self, phase: str) -> None:
         """Call backend.set_instruction when the phase changes."""
+        if self._port_pos is None:
+            return
         if phase == self._current_phase:
             return
         prompt = self._phase_prompts.get(phase)
@@ -416,6 +426,47 @@ class RunRLT(Policy):
             self._current_phase = phase
         except Exception as e:
             self.get_logger().warn(f"set_instruction failed on phase={phase}: {e}")
+
+    # Max position delta per control step (m). Prevents large jumps that
+    # generate torques exceeding Gazebo's effort limits.
+    _MAX_POS_DELTA: float = 0.005  # 5 mm per step @ 20 Hz = 10 cm/s max
+    _MAX_ROT_DELTA: float = 0.05  # ~3° per step @ 20 Hz = 60°/s max
+
+    def _clamp_action(self, action: np.ndarray, obs: "Observation") -> np.ndarray:
+        """Clamp action so the commanded pose is close to the current TCP pose.
+
+        CheatCode works because it interpolates smoothly over 100 steps.
+        Without clamping, the actor can command a pose far from the current
+        one → huge joint torques → effort clamped to 0 → arm collapses.
+        """
+        current_pos = np.array(
+            [
+                obs.controller_state.tcp_pose.position.x,
+                obs.controller_state.tcp_pose.position.y,
+                obs.controller_state.tcp_pose.position.z,
+            ],
+            dtype=np.float32,
+        )
+
+        # Clamp position delta
+        pos_delta = action[0:3] - current_pos
+        pos_norm = np.linalg.norm(pos_delta)
+        if pos_norm > self._MAX_POS_DELTA:
+            action = action.copy()
+            action[0:3] = current_pos + pos_delta * (self._MAX_POS_DELTA / pos_norm)
+
+        # Clamp rotation delta (in 6D space — limit the norm of the change)
+        from aic_rlt.vla.xvla_wrapper import quat_to_rot6d
+
+        q = obs.controller_state.tcp_pose.orientation
+        current_rot6d = quat_to_rot6d(np.array([q.x, q.y, q.z, q.w], dtype=np.float32))
+        rot_delta = action[3:9] - current_rot6d
+        rot_norm = np.linalg.norm(rot_delta)
+        if rot_norm > self._MAX_ROT_DELTA:
+            action = action.copy() if not action.flags.writeable else action
+            action[3:9] = current_rot6d + rot_delta * (self._MAX_ROT_DELTA / rot_norm)
+
+        return action
 
     def _action_to_motion_update(self, action: np.ndarray) -> MotionUpdate:
         """Convert a 9-dim action [xyz, r1, r2] to a MotionUpdate.
@@ -440,11 +491,12 @@ class RunRLT(Policy):
                 w=float(quat[3]),
             ),
         )
+        # Match CheatCode defaults (policy.py:set_pose_target)
         motion_update.target_stiffness = (
-            np.diag([85.0, 85.0, 85.0, 50.0, 50.0, 50.0]).flatten().tolist()
+            np.diag([90.0, 90.0, 90.0, 50.0, 50.0, 50.0]).flatten().tolist()
         )
         motion_update.target_damping = (
-            np.diag([75.0, 75.0, 75.0, 20.0, 20.0, 20.0]).flatten().tolist()
+            np.diag([50.0, 50.0, 50.0, 20.0, 20.0, 20.0]).flatten().tolist()
         )
         motion_update.feedforward_wrench_at_tip = Wrench(
             force=Vector3(x=0.0, y=0.0, z=0.0),
@@ -508,16 +560,21 @@ class RunRLT(Policy):
                 self._maybe_switch_prompt(self._estimate_phase(prop_np))
 
                 z_rl, prop, ref_chunk = self._encode_rl_state(obs)
-                with torch.no_grad():
-                    action_chunk_t = self.actor.get_mean(
-                        z_rl, prop, ref_chunk
-                    )  # (1, C, D)
-                action_chunk = action_chunk_t.squeeze(0).cpu().numpy()  # (C, D)
+                if self._vla_only:
+                    # Execute VLA reference actions directly (debug mode)
+                    action_chunk = ref_chunk.squeeze(0).cpu().numpy()  # (C, D)
+                else:
+                    with torch.no_grad():
+                        action_chunk_t = self.actor.get_mean(
+                            z_rl, prop, ref_chunk
+                        )  # (1, C, D)
+                    action_chunk = action_chunk_t.squeeze(0).cpu().numpy()  # (C, D)
                 chunk_step = 0
 
             action = action_chunk[chunk_step]
             chunk_step += 1
 
+            action = self._clamp_action(action, obs)
             move_robot(motion_update=self._action_to_motion_update(action))
             send_feedback(f"RLT step {chunk_step}/{self.CHUNK_LENGTH}")
 
