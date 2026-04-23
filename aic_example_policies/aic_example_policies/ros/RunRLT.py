@@ -457,6 +457,19 @@ class RunRLT(Policy):
     ) -> bool:
         self.get_logger().info(f"RunRLT.insert_cable() start. Task: {task}")
 
+        # Clear JAX compile caches at each trial boundary. Observed during
+        # multi-trial aic_engine eval: GPU memory grew across trials until
+        # trial 2 or 3 hit CUDA_ERROR_OUT_OF_MEMORY during pi0.5 SigLIP
+        # forward. Same pattern we already mitigate in prepare_embeddings
+        # (commit 5851cf4). Only runs on backends that use JAX; plain PyTorch
+        # backends (e.g. XVLA) shouldn't need this and it's a harmless no-op.
+        if not getattr(self._vla, "actions_are_bc_targets", True):
+            try:
+                import jax  # lazy — don't force JAX import in non-JAX backends
+                jax.clear_caches()
+            except Exception as e:
+                self.get_logger().warn(f"jax.clear_caches() failed: {e}")
+
         dt = 1.0 / self.control_hz
         timeout_sec = 60.0
         start_time = time.time()
