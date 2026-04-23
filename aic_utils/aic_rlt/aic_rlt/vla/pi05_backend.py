@@ -58,6 +58,7 @@ def _setup_openpi_path():
     try:
         import openpi  # noqa: F401
         import openpi_client  # noqa: F401
+
         return  # already importable from the current env; do not taint sys.path
     except ImportError:
         pass
@@ -163,7 +164,8 @@ class Pi05Backend(VLABackend):
 
         logger.info(
             "Loading Pi0.5 model from %s (asset_id=%s) ...",
-            self._checkpoint_dir, self._asset_id,
+            self._checkpoint_dir,
+            self._asset_id,
         )
         _setup_openpi_path()
 
@@ -180,6 +182,7 @@ class Pi05Backend(VLABackend):
         # structure), then replace the data factory wholesale with a UR5 one.
         base_config = openpi_config.get_config(self._openpi_config)
         from ._ur5_transforms import make_ur5_data_config_cls
+
         Pi05UR5DataConfig = make_ur5_data_config_cls()
         # Point assets_dir at the checkpoint's own assets/ so the internal
         # create_base_config doesn't warn about a missing norm_stats path
@@ -198,7 +201,8 @@ class Pi05Backend(VLABackend):
         # Load norm_stats from the ur5e sub-folder of the shipped assets, since
         # the default asset_id="trossen" (inherited from pi05_aloha) doesn't apply.
         norm_stats = _checkpoints.load_norm_stats(
-            checkpoint_dir / "assets", self._asset_id,
+            checkpoint_dir / "assets",
+            self._asset_id,
         )
 
         self._policy = policy_config.create_trained_policy(
@@ -221,6 +225,7 @@ class Pi05Backend(VLABackend):
         }
         inputs = self._policy._input_transform(probe_input)
         import jax
+
         inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
         probe_obs = _model.Observation.from_dict(inputs)
         probe_obs = _model.preprocess_observation(None, probe_obs, train=False)
@@ -231,7 +236,9 @@ class Pi05Backend(VLABackend):
         self._loaded = True
         logger.info(
             "Pi05Backend ready: num_tokens=%d, embed_dim=%d, action_dim=%d",
-            self.num_tokens, self.embed_dim, self.action_dim,
+            self.num_tokens,
+            self.embed_dim,
+            self.action_dim,
         )
 
     def _obs_to_pi05_input(self, obs) -> dict:
@@ -266,7 +273,11 @@ class Pi05Backend(VLABackend):
 
         joints = np.asarray(obs.joint_states.position[:6], dtype=np.float32)
         gripper = np.asarray(
-            [obs.joint_states.position[6]] if len(obs.joint_states.position) > 6 else [0.0],
+            (
+                [obs.joint_states.position[6]]
+                if len(obs.joint_states.position) > 6
+                else [0.0]
+            ),
             dtype=np.float32,
         )
 
@@ -300,7 +311,10 @@ class Pi05Backend(VLABackend):
         }
 
     def _run_forward_with_embeddings(
-        self, obs, *, want_actions: bool = True,
+        self,
+        obs,
+        *,
+        want_actions: bool = True,
     ) -> tuple[np.ndarray, np.ndarray | None]:
         """Run pi0.5 forward pass → (prefix_embeddings, actions_or_None).
 
@@ -348,10 +362,17 @@ class Pi05Backend(VLABackend):
         )
 
         # Unnormalize actions
-        actions_np = np.array(jax.device_get(actions_jax[0].astype(jnp.float32)), dtype=np.float32)
-        outputs = {"actions": actions_np, "state": np.array(jax.device_get(inputs["state"][0].astype(jnp.float32)), dtype=np.float32)}
+        actions_np = np.array(
+            jax.device_get(actions_jax[0].astype(jnp.float32)), dtype=np.float32
+        )
+        outputs = {
+            "actions": actions_np,
+            "state": np.array(
+                jax.device_get(inputs["state"][0].astype(jnp.float32)), dtype=np.float32
+            ),
+        }
         outputs = self._policy._output_transform(outputs)
-        actions_np = outputs["actions"][:, :self.action_dim]
+        actions_np = outputs["actions"][:, : self.action_dim]
 
         return prefix_embeds, actions_np
 
@@ -377,11 +398,11 @@ class Pi05Backend(VLABackend):
     def get_action_chunk(self, obs) -> np.ndarray:
         """(chunk_length, action_dim) float32."""
         _, actions = self._run_forward_with_embeddings(obs)
-        return actions[:self.chunk_length].astype(np.float32)
+        return actions[: self.chunk_length].astype(np.float32)
 
     def get_embeddings_and_actions(self, obs) -> tuple:
         """Single Pi0.5 forward pass — more efficient than two separate calls."""
         prefix_embeds, actions = self._run_forward_with_embeddings(obs)
         embeddings = torch.from_numpy(prefix_embeds).unsqueeze(0).to(self.device)
-        action_chunk = actions[:self.chunk_length].astype(np.float32)
+        action_chunk = actions[: self.chunk_length].astype(np.float32)
         return embeddings, action_chunk

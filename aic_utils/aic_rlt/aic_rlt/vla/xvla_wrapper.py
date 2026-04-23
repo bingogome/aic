@@ -83,10 +83,10 @@ from ._rotation import (  # noqa: F401
     quat_actions_to_rot6d,
 )
 
-
 # ---------------------------------------------------------------------------
 # XVLA Wrapper
 # ---------------------------------------------------------------------------
+
 
 class XVLAWrapper:
     """Wraps XVLAPolicy for RLT embedding extraction and reference action generation.
@@ -145,12 +145,15 @@ class XVLAWrapper:
 
     def _preprocess_image(self, image_np: np.ndarray) -> torch.Tensor:
         """(H, W, 3) uint8 RGB → (1, 3, image_size, image_size) float32."""
-        img = torch.from_numpy(image_np).permute(2, 0, 1)            # (3, H, W) uint8
-        img = TF.resize(img, [self.image_size, self.image_size],
-                         interpolation=TF.InterpolationMode.BILINEAR)
+        img = torch.from_numpy(image_np).permute(2, 0, 1)  # (3, H, W) uint8
+        img = TF.resize(
+            img,
+            [self.image_size, self.image_size],
+            interpolation=TF.InterpolationMode.BILINEAR,
+        )
         img = img.float() / 255.0
         img = TF.normalize(img, _IMAGENET_MEAN, _IMAGENET_STD)
-        return img.unsqueeze(0)                                       # (1, 3, H, W)
+        return img.unsqueeze(0)  # (1, 3, H, W)
 
     # ------------------------------------------------------------------
     # Embedding extraction (for RLT Phase 1)
@@ -167,7 +170,7 @@ class XVLAWrapper:
             (num_tokens, 1024) float32 on CPU
         """
         img_t = self._preprocess_image(image_np).to(self.device)
-        pixel_values = img_t.unsqueeze(1)                             # (1, 1, 3, H, W)
+        pixel_values = img_t.unsqueeze(1)  # (1, 1, 3, H, W)
         image_mask = torch.ones(1, 1, dtype=torch.bool, device=self.device)
 
         out = self.policy.model.forward_vlm(
@@ -175,7 +178,7 @@ class XVLAWrapper:
             pixel_values=pixel_values,
             image_mask=image_mask,
         )
-        return out["vlm_features"].squeeze(0).cpu()                   # (num_tokens, 1024)
+        return out["vlm_features"].squeeze(0).cpu()  # (num_tokens, 1024)
 
     # ------------------------------------------------------------------
     # Reference action chunk (for RLT actor conditioning at inference)
@@ -203,17 +206,17 @@ class XVLAWrapper:
         joints = prop[_JOINT_START:_JOINT_END].astype(np.float32)
         state_8 = np.zeros(8, dtype=np.float32)
         state_8[:7] = joints
-        state_t = torch.from_numpy(state_8).unsqueeze(0).to(self.device)   # (1, 8)
+        state_t = torch.from_numpy(state_8).unsqueeze(0).to(self.device)  # (1, 8)
 
         batch = {
-            "observation.images.image": img_t,     # (1, 3, H, W)
-            OBS_LANGUAGE_TOKENS: self.input_ids,   # (1, TOKEN_MAX_LEN)
-            OBS_STATE: state_t,                    # (1, 8)
+            "observation.images.image": img_t,  # (1, 3, H, W)
+            OBS_LANGUAGE_TOKENS: self.input_ids,  # (1, TOKEN_MAX_LEN)
+            OBS_STATE: state_t,  # (1, 8)
         }
 
         # Returns (1, chunk_size, 20) — XVLA's full chunk
         actions = self.policy._get_action_chunk(batch)
-        actions_np = actions.squeeze(0).cpu().numpy()   # (chunk_size, 20)
+        actions_np = actions.squeeze(0).cpu().numpy()  # (chunk_size, 20)
 
         # Take first chunk_length steps and extract [xyz, r1, r2] (9D)
         result = np.zeros((self.chunk_length, 9), dtype=np.float32)
