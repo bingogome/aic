@@ -1165,6 +1165,8 @@ environments:
       - pypi: https://pypi.nvidia.com/nvidia-nvtx-cu12/nvidia_nvtx_cu12-12.8.55-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/be/9c/92789c596b8df838baa98fa71844d84283302f7604ed565dafe5a6b5041a/oauthlib-3.3.1-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/4b/33/b5db29a6c00eb8f50708110d8d453747ca125c8b805bc437b289dbdcc057/opencv_python_headless-4.13.0.92-cp37-abi3-manylinux_2_28_x86_64.whl
+      - pypi: git+https://github.com/sl628/openpi.git?rev=6a74d39e764bce61559ccc944c1ce3ccdbeed6ba#6a74d39e764bce61559ccc944c1ce3ccdbeed6ba
+      - pypi: git+https://github.com/sl628/openpi.git?subdirectory=packages%2Fopenpi-client&rev=6a74d39e764bce61559ccc944c1ce3ccdbeed6ba#6a74d39e764bce61559ccc944c1ce3ccdbeed6ba
       - pypi: https://files.pythonhosted.org/packages/23/cd/066e86230ae37ed0be70aae89aabf03ca8d9f39c8aea0dec8029455b5540/opt_einsum-3.4.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/8a/69/6a93d8600c339d7687a05857c7907bd4dd8cf88691a5ea106d7a50af90a1/optax-0.2.8-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/27/57/700709ca012b8595230dd2a004fbe284a57e6838f966d58c956d4529a2db/orbax_checkpoint-0.11.13-py3-none-any.whl
@@ -1231,8 +1233,6 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/11/4f/426f91b96701ec2f37bb2b8cec664eff4f658a11f3fa9d94f0a887ea6d2b/xxhash-3.6.0-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/66/3e/868e5c3364b6cee19ff3e1a122194fa4ce51def02c61023970442162859e/yarl-1.23.0-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl
       - pypi: ./aic_utils/aic_rlt
-      - pypi: /home/yifeng/workspace/openpi
-      - pypi: /home/yifeng/workspace/openpi/packages/openpi-client
 packages:
 - conda: https://conda.anaconda.org/conda-forge/linux-64/_openmp_mutex-4.5-20_gnu.conda
   build_number: 20
@@ -7354,10 +7354,9 @@ packages:
   purls: []
   size: 786149
   timestamp: 1775741359582
-- pypi: /home/yifeng/workspace/openpi
+- pypi: git+https://github.com/sl628/openpi.git?rev=6a74d39e764bce61559ccc944c1ce3ccdbeed6ba#6a74d39e764bce61559ccc944c1ce3ccdbeed6ba
   name: openpi
   version: 0.1.0
-  sha256: c61a588a6aaedfae52c8dde03eb97dc65bdb82e9e292bf8ad44995be43323933
   requires_dist:
   - augmax>=0.3.4
   - dm-tree>=0.1.8
@@ -7389,10 +7388,9 @@ packages:
   - rich>=14.0.0
   - polars>=1.30.0
   requires_python: '>=3.11'
-- pypi: /home/yifeng/workspace/openpi/packages/openpi-client
+- pypi: git+https://github.com/sl628/openpi.git?subdirectory=packages%2Fopenpi-client&rev=6a74d39e764bce61559ccc944c1ce3ccdbeed6ba#6a74d39e764bce61559ccc944c1ce3ccdbeed6ba
   name: openpi-client
   version: 0.1.0
-  sha256: 48d7403ada643b367d5d9eebf449f9c9a440d830330896bca77d24c706e14aeb
   requires_dist:
   - dm-tree>=0.1.8
   - msgpack>=1.0.5

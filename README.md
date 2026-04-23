@@ -190,40 +190,24 @@ The [aic_isaac](./aic_utils/aic_isaac/) folder contains files licensed under BSD
 
 ---
 
-## `pi05` branch — local-only openpi patches (TODO: fork and pin)
+## `pi05` branch — openpi patches live on a fork
 
 The `pi05` pixi environment (`pixi run -e pi05 ...`) installs openpi from
-a local editable path:
-```
-[feature.pi05.pypi-dependencies]
-openpi       = { path = "/home/yifeng/workspace/openpi", editable = true }
-openpi-client = { path = "/home/yifeng/workspace/openpi/packages/openpi-client", editable = true }
-```
-
-That openpi checkout has **two local-only commits** (on `main`) needed for
-the pi05 env to solve and import cleanly:
+the [`sl628/openpi`](https://github.com/sl628/openpi) fork, branch
+`aic-patches` (pinned by SHA in `pixi.toml`). That branch carries two
+aic-specific commits on top of upstream `Physical-Intelligence/openpi`:
 
 1. `a809e3f` — lazy-import `lerobot` in `openpi/training/data_loader.py` +
    `checkpoints.py`; relax `numpy`, `transformers` upper bounds; drop
    `openpi-client` from `[project.dependencies]` to avoid a pixi URL
-   conflict; remove `lerobot` git-source pin so aic can pin its own pypi
-   `lerobot==0.5.1`.
+   conflict; remove the `lerobot` git-source pin so aic can pin its own
+   pypi `lerobot==0.5.1`.
 2. `6a74d39` — drop unused `opencv-python` dep (pulls conflicting
    `libtiff.so.6` downstream).
 
-These commits **are not pushed upstream**. If you clone this `pi05`
-branch onto a fresh machine, `pixi install -e pi05` will fail unless
-`/home/yifeng/workspace/openpi` on that machine has these patches.
+The pi05 env is reproducible on any machine from just this repo; no
+local openpi checkout required.
 
-### TODO: replace the local-path install with a pinned fork
-
-- Fork `Physical-Intelligence/openpi` to a repo we own.
-- Rebase these two commits on the fork's default branch.
-- In `pixi.toml`, replace the `{ path = ... }` specs with git refs:
-  ```
-  openpi        = { git = "https://github.com/<our-org>/openpi", rev = "<sha>" }
-  openpi-client = { git = "https://github.com/<our-org>/openpi", subdirectory = "packages/openpi-client", rev = "<sha>" }
-  ```
-- Remove this section once done.
-
-Tracking issue (create one): "pi05 env depends on local openpi patches".
+To update the pinned openpi SHA: push new commits to `sl628/openpi:aic-patches`,
+then update the `rev = "..."` values under `[feature.pi05.pypi-dependencies]`
+in `pixi.toml` and run `pixi install -e pi05` to refresh the lockfile.
