@@ -187,3 +187,43 @@ Manages trial execution, validates participant models, and collects scoring data
 
 This project is licensed under the Apache License 2.0 - see the individual package files for details.
 The [aic_isaac](./aic_utils/aic_isaac/) folder contains files licensed under BSD-3 - see [aic_isaac/LICENSE](./aic_utils/aic_isaac/LICENSE).
+
+---
+
+## `pi05` branch — local-only openpi patches (TODO: fork and pin)
+
+The `pi05` pixi environment (`pixi run -e pi05 ...`) installs openpi from
+a local editable path:
+```
+[feature.pi05.pypi-dependencies]
+openpi       = { path = "/home/yifeng/workspace/openpi", editable = true }
+openpi-client = { path = "/home/yifeng/workspace/openpi/packages/openpi-client", editable = true }
+```
+
+That openpi checkout has **two local-only commits** (on `main`) needed for
+the pi05 env to solve and import cleanly:
+
+1. `a809e3f` — lazy-import `lerobot` in `openpi/training/data_loader.py` +
+   `checkpoints.py`; relax `numpy`, `transformers` upper bounds; drop
+   `openpi-client` from `[project.dependencies]` to avoid a pixi URL
+   conflict; remove `lerobot` git-source pin so aic can pin its own pypi
+   `lerobot==0.5.1`.
+2. `6a74d39` — drop unused `opencv-python` dep (pulls conflicting
+   `libtiff.so.6` downstream).
+
+These commits **are not pushed upstream**. If you clone this `pi05`
+branch onto a fresh machine, `pixi install -e pi05` will fail unless
+`/home/yifeng/workspace/openpi` on that machine has these patches.
+
+### TODO: replace the local-path install with a pinned fork
+
+- Fork `Physical-Intelligence/openpi` to a repo we own.
+- Rebase these two commits on the fork's default branch.
+- In `pixi.toml`, replace the `{ path = ... }` specs with git refs:
+  ```
+  openpi        = { git = "https://github.com/<our-org>/openpi", rev = "<sha>" }
+  openpi-client = { git = "https://github.com/<our-org>/openpi", subdirectory = "packages/openpi-client", rev = "<sha>" }
+  ```
+- Remove this section once done.
+
+Tracking issue (create one): "pi05 env depends on local openpi patches".
