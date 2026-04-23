@@ -13,11 +13,20 @@ export ZENOH_CONFIG_OVERRIDE="${ZENOH_CONFIG_OVERRIDE:-transport/shared_memory/e
 # Guarded on CONDA_PREFIX so the default env is not affected.
 case "${CONDA_PREFIX:-}" in
   */envs/pi05)
-    _pi05_libtiff="${CONDA_PREFIX}/lib/libtiff.so.6"
-    _pi05_libjpeg="${CONDA_PREFIX}/lib/libjpeg.so.8"
-    if [[ -f "${_pi05_libtiff}" && -f "${_pi05_libjpeg}" ]]; then
-      export LD_PRELOAD="${_pi05_libjpeg}:${_pi05_libtiff}${LD_PRELOAD:+:${LD_PRELOAD}}"
+    # Build LD_PRELOAD out of whichever of these conda libs exist. Order
+    # matters: the first resolver hit wins, but LD_PRELOAD loads all of
+    # them up front into the process before any ROS shared object has a
+    # chance to pull in their system counterparts.
+    _pi05_preload=""
+    for _lib in libjpeg.so.8 libpng16.so.16 libtiff.so.6 libwebp.so.7 libopenjp2.so.7; do
+      if [[ -f "${CONDA_PREFIX}/lib/${_lib}" ]]; then
+        _pi05_preload="${_pi05_preload:+${_pi05_preload}:}${CONDA_PREFIX}/lib/${_lib}"
+      fi
+    done
+    if [[ -n "${_pi05_preload}" ]]; then
+      export LD_PRELOAD="${_pi05_preload}${LD_PRELOAD:+:${LD_PRELOAD}}"
     fi
-    unset _pi05_libtiff _pi05_libjpeg
+    unset _pi05_preload _lib
+
     ;;
 esac
