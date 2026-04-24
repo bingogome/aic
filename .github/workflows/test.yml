@@ -31,6 +31,7 @@ jobs:
           cache: true
           cache-write: ${{ github.event_name == 'push' && github.ref_name == 'main' }}
           activate-environment: true
+          frozen: true
           # Skip the pi05 env here: the unit tests don't need JAX/openpi
           # (they exercise pure-numpy + pytorch paths). pi05-specific
           # integration is verified manually via Gazebo eval.

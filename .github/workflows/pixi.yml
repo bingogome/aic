@@ -34,6 +34,7 @@ jobs:
           cache: true
           cache-write: ${{ github.event_name == 'push' && github.ref_name == 'main' }}
           activate-environment: true
+          frozen: true
           # Skip the pi05 env in CI: it pulls JAX + openpi (several GB) and
           # exercises pi0.5-specific inference, which isn't what this style-
           # and-type-check workflow is for. Tests of pi05 code that matter
