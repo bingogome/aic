@@ -170,15 +170,19 @@ distrobox enter -r aic_eval
 
 **Terminal 3 — start the aic_model node with our policy (aic pixi env):**
 
+The aic pixi env has no `pip` (conda-only). We use `PYTHONPATH` so the package becomes importable without installing into the env. (`requests` is already available via pixi deps.)
+
 ```bash
-cd ~/workspace/aic
-pip install requests   # one-time, into the pixi env
-pip install -e .claude/worktree-xvla-finetune/aic_utils/aic_xvla   # adapter package
+cd ~/workspace/aic/.claude/worktree-xvla-finetune
+export PYTHONPATH=$PWD/aic_utils/aic_xvla
 export AIC_XVLA_SERVER_URL=http://127.0.0.1:8010
+
 pixi run ros2 run aic_model aic_model --ros-args \
     -p use_sim_time:=true \
     -p policy:=aic_xvla.ros.RunXVLA.RunXVLA
 ```
+
+> If you have a `(base)` conda env active, `pixi run pip` falls through to conda's pip and installs into the wrong python. Either `conda deactivate` first, or just stick with `PYTHONPATH` — it works regardless of conda state.
 
 The policy will:
 - POST each `Observation` to `/act` (state[26] + 3 base64 JPEGs + instruction)
