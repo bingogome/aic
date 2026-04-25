@@ -37,6 +37,25 @@ def _is_lora_ckpt(path: str) -> bool:
     return os.path.isfile(os.path.join(path, "adapter_config.json"))
 
 
+def _load_action_encoding(checkpoint: str) -> str:
+    """Resolve the action encoding for a checkpoint.
+
+    Lookup order:
+      1. <checkpoint>/aic_xvla_meta.json
+      2. <parent of checkpoint>/aic_xvla_meta.json (where train.py writes it)
+      3. AIC_XVLA_ACTION_ENCODING env var
+      4. default 'delta' (preserves pre-toggle behavior)
+    """
+    for d in (checkpoint, os.path.dirname(checkpoint.rstrip("/"))):
+        sidecar = os.path.join(d, "aic_xvla_meta.json")
+        if os.path.isfile(sidecar):
+            with open(sidecar) as f:
+                enc = json.load(f).get("action_encoding")
+            if enc:
+                return enc.lower()
+    return os.environ.get("AIC_XVLA_ACTION_ENCODING", "delta").lower()
+
+
 def _load_model(checkpoint: str, device: str) -> tuple[torch.nn.Module, XVLAProcessor]:
     if _is_lora_ckpt(checkpoint):
         from peft import PeftModel
@@ -65,6 +84,10 @@ class AICXVLAPolicy:
         self.device = device
         self.domain_id = domain_id
         self.steps = steps
+        self.action_encoding = _load_action_encoding(checkpoint)
+        if self.action_encoding not in ("delta", "absolute"):
+            raise ValueError(f"unknown action_encoding {self.action_encoding!r}")
+        print(f"AICXVLAPolicy: action_encoding={self.action_encoding}")
 
     @torch.no_grad()
     def predict(
@@ -105,16 +128,24 @@ class AICXVLAPolicy:
             steps=self.steps,
             **lang,
         )  # [1, num_actions, 20]
-        return self._xvla_to_aic_actions(actions[0].cpu().float().numpy(), proprio[:3])
+        return self._xvla_to_aic_actions(
+            actions[0].cpu().float().numpy(), proprio[:3], self.action_encoding
+        )
 
     @staticmethod
-    def _xvla_to_aic_actions(act20: np.ndarray, proprio_pos: np.ndarray) -> np.ndarray:
+    def _xvla_to_aic_actions(
+        act20: np.ndarray, proprio_pos: np.ndarray, action_encoding: str = "delta"
+    ) -> np.ndarray:
         """[T, 20] -> [T, 7] = pos(3) + quat_xyzw(4).
 
-        Position is predicted as a delta vs. proprio (matching `idx_for_delta=[0,1,2]`
-        in the training handler), so we add proprio_pos back here to recover absolute.
+        With action_encoding='delta' (handler trained with idx_for_delta=[0,1,2]),
+        the model predicts target_pos - proprio_pos, so we add proprio_pos back
+        here. With 'absolute' (idx_for_delta=[]), the model emits target_pos
+        directly and we use it as-is.
         """
-        pos = act20[:, 0:3] + proprio_pos.reshape(1, 3)
+        pos = act20[:, 0:3]
+        if action_encoding == "delta":
+            pos = pos + proprio_pos.reshape(1, 3)
         rot6d = act20[:, 3:9]
         quat = rotate6d_to_quat(rot6d, scalar_first=False)
         return np.concatenate([pos, quat], axis=-1).astype(np.float32)

@@ -81,6 +81,27 @@ def main() -> None:
     parser = argparse.ArgumentParser("aic-xvla training", parents=[get_args_parser()])
     args = parser.parse_args(remaining)
 
+    # Persist the action encoding next to the run dir so eval.py can auto-detect
+    # which decode path to use for any ckpt produced by this run. Read from the
+    # same env var the handler used at module load.
+    import json
+    import os
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    sidecar = os.path.join(args.output_dir, "aic_xvla_meta.json")
+    with open(sidecar, "w") as f:
+        json.dump(
+            {
+                "action_encoding": os.environ.get(
+                    "AIC_XVLA_ACTION_ENCODING", "delta"
+                ).lower(),
+                "mode": pre_args.mode,
+                "wandb_run_name": pre_args.wandb_run_name,
+            },
+            f,
+            indent=2,
+        )
+
     if pre_args.wandb_project:
         cfg = {**vars(args), "mode": pre_args.mode}
         _init_wandb(

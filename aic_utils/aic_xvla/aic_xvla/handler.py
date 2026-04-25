@@ -34,6 +34,16 @@ from scipy.interpolate import interp1d
 DATASET_NAME = "aic"
 DEFAULT_INSTRUCTION = "insert the SFP cable into the port"
 
+# "delta": position predicted relative to proprio (X-VLA's action_slice
+# subtracts proprio[idx] at training; eval adds it back).
+# "absolute": position predicted in base_link directly (matches dataset).
+ACTION_ENCODING = os.environ.get("AIC_XVLA_ACTION_ENCODING", "delta").lower()
+if ACTION_ENCODING not in ("delta", "absolute"):
+    raise ValueError(
+        f"AIC_XVLA_ACTION_ENCODING must be delta|absolute, got {ACTION_ENCODING!r}"
+    )
+_IDX_FOR_DELTA = [0, 1, 2] if ACTION_ENCODING == "delta" else []
+
 
 def _state_to_proprio(state: np.ndarray) -> np.ndarray:
     """state: [26] -> proprio: [10] = pos(3) + rot6d(6) + gripper(1)."""
@@ -83,8 +93,8 @@ class AICHandler(DomainHandler):
         "image_path_right_camera",
     ]
     QDUR = 1.0  # seconds of future window
-    # 9D action: deltas on pos+rot6d, gripper absolute. Adjust to taste.
-    idx_for_delta = [0, 1, 2]
+    # Driven by AIC_XVLA_ACTION_ENCODING env var (read at module load).
+    idx_for_delta = _IDX_FOR_DELTA
     idx_for_mask_proprio: list[int] = []
 
     def iter_episode(
