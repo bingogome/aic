@@ -24,12 +24,18 @@ Debug aids (optional, off by default):
     AIC_XVLA_BGR_INPUT=1       treat ROS image bytes as BGR instead of RGB
                                (toggle to test the channel-order hypothesis
                                without recompiling).
+    AIC_XVLA_TRACE_PATH        if set, append a JSONL line per inference call
+                               with the same schema as aic_xvla.replay --trace,
+                               so offline and closed-loop runs can be diffed.
+                               Frames are also dumped under <dir>/images/ to
+                               make A/B against the training JPEGs trivial.
 """
 
 from __future__ import annotations
 
 import base64
 import io
+import json
 import os
 import time
 
@@ -104,11 +110,22 @@ class RunXVLA(Policy):
         )
         self.debug_image_dir = os.environ.get("AIC_XVLA_DEBUG_IMAGE_DIR", "") or None
         self.bgr_input = os.environ.get("AIC_XVLA_BGR_INPUT", "0") == "1"
+        self.trace_path = os.environ.get("AIC_XVLA_TRACE_PATH", "") or None
         self._dumped_images = False
+        self._trace_fp = None
+        self._trace_image_dir: str | None = None
+        if self.trace_path:
+            os.makedirs(os.path.dirname(self.trace_path) or ".", exist_ok=True)
+            self._trace_image_dir = os.path.join(
+                os.path.dirname(self.trace_path) or ".", "images"
+            )
+            os.makedirs(self._trace_image_dir, exist_ok=True)
+            self._trace_fp = open(self.trace_path, "w")
         self.get_logger().info(
             f"RunXVLA server={self.server_url} replan_every={self.replan_every} "
             f"timeout_s={self.timeout_s} control_period_s={self.control_period_s} "
-            f"debug_image_dir={self.debug_image_dir} bgr_input={self.bgr_input}"
+            f"debug_image_dir={self.debug_image_dir} bgr_input={self.bgr_input} "
+            f"trace_path={self.trace_path}"
         )
         self._wait_for_server()
 
@@ -125,6 +142,50 @@ class RunXVLA(Policy):
         self.get_logger().warn(
             f"server at {self.server_url} not responding; continuing anyway"
         )
+
+    def _save_trace_images(self, obs: Observation, step: int) -> list[str]:
+        """Write the 3 cam frames for this step under the trace's images/ dir."""
+        if not self._trace_image_dir:
+            return []
+        paths: list[str] = []
+        for cam, msg in [
+            ("left", obs.left_image),
+            ("center", obs.center_image),
+            ("right", obs.right_image),
+        ]:
+            arr = np.frombuffer(msg.data, dtype=np.uint8).reshape(
+                msg.height, msg.width, 3
+            )
+            bgr = arr if self.bgr_input else cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+            rel = f"images/{cam}/{step:06d}.jpg"
+            full = os.path.join(self._trace_image_dir, "..", rel)
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            cv2.imwrite(full, bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+            paths.append(rel)
+        return paths
+
+    def _write_trace_line(
+        self,
+        step: int,
+        obs: Observation,
+        instruction: str,
+        chunk: np.ndarray,
+        image_paths: list[str],
+    ) -> None:
+        if self._trace_fp is None:
+            return
+        state = _state_from_observation(obs)
+        line = {
+            "step": int(step),
+            "live_pos": state[:3].tolist(),
+            "live_quat_xyzw": state[3:7].tolist(),
+            "live_joints": state[19:26].tolist(),
+            "instruction": instruction,
+            "image_paths": image_paths,
+            "pred_actions": chunk.tolist(),
+        }
+        self._trace_fp.write(json.dumps(line) + "\n")
+        self._trace_fp.flush()
 
     def _maybe_dump_first_frame(self, obs: Observation) -> None:
         if not self.debug_image_dir or self._dumped_images:
@@ -226,9 +287,12 @@ class RunXVLA(Policy):
                     t_inf = time.time()
                     chunk = self._request_actions(obs, instruction)
                     chunk_idx = 0
+                    inf_dt = time.time() - t_inf
                     self.get_logger().info(
-                        f"chunk shape={tuple(chunk.shape)} inf_dt={time.time()-t_inf:.2f}s"
+                        f"chunk shape={tuple(chunk.shape)} inf_dt={inf_dt:.2f}s"
                     )
+                    image_paths = self._save_trace_images(obs, step)
+                    self._write_trace_line(step, obs, instruction, chunk, image_paths)
                 except Exception as ex:
                     self.get_logger().error(f"inference failed: {ex}")
                     send_feedback(f"inference error: {ex}")
@@ -250,4 +314,8 @@ class RunXVLA(Policy):
             self.sleep_for(max(0.0, self.control_period_s - elapsed))
 
         self.get_logger().info("RunXVLA.insert_cable() exiting (timeout)")
+        if self._trace_fp is not None:
+            self._trace_fp.close()
+            self._trace_fp = None
+            self.get_logger().info(f"wrote trace to {self.trace_path}")
         return True
