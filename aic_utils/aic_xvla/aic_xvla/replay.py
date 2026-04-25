@@ -1,12 +1,12 @@
 """Offline replay eval: predict action chunks for sampled frames of an aic
 episode and compare against ground-truth actions.
 
-Reports:
-  - per-axis mean absolute error on TCP position (xyz, in meters)
-  - quaternion-distance angle error (radians)
-  - per-step trajectory error for the first action of each chunk
+Reports per-axis MAE on TCP position (m) and quat-angle error (deg).
 
-Use this as a sanity check before closed-loop rollouts in the engine.
+Use --trace <path>.jsonl to record full per-frame inputs and outputs:
+each line is {"frame": int, "live_pos": [...], "live_quat": [...],
+"instruction": str, "image_paths": [...], "pred_actions": [[...], ...],
+"gt_actions": [[...], ...], "pos_err": [...], "ang_err_deg": [...]}.
 """
 
 from __future__ import annotations
@@ -36,6 +36,7 @@ def replay_episode(
     instruction: str,
     sample_every: int,
     horizon: int,
+    trace_fp=None,
 ) -> dict:
     table = pq.read_table(parquet_path).to_pydict()
     n_frames = len(table["frame_index"])
@@ -53,21 +54,19 @@ def replay_episode(
     print(
         f"replaying {len(sampled_idx)} frames (every {sample_every}, horizon {horizon}) of {n_frames}"
     )
+    print(f"first frame proprio xyz: {state[0, :3].round(4).tolist()}")
+    print(f"first frame action xyz : {action_gt[0, :3].round(4).tolist()}")
 
     for n, idx in enumerate(sampled_idx):
-        images = [
-            Image.open(os.path.join(image_root, left_paths[idx])),
-            Image.open(os.path.join(image_root, center_paths[idx])),
-            Image.open(os.path.join(image_root, right_paths[idx])),
-        ]
+        rel_paths = [left_paths[idx], center_paths[idx], right_paths[idx]]
+        images = [Image.open(os.path.join(image_root, p)) for p in rel_paths]
         proprio = _state_to_proprio(state[idx])  # [10]
         pred = policy.predict(images, proprio, instruction)  # [num_actions, 7]
-        # Compare first `horizon` predictions to next `horizon` GT actions.
+
         h = min(horizon, pred.shape[0], n_frames - idx)
         pred_h = pred[:h]
         gt_h = action_gt[idx : idx + h]
         pos_err = np.abs(pred_h[:, :3] - gt_h[:, :3])  # [h, 3]
-        # Normalize quats before angle distance (model output may drift slightly).
         pred_q = pred_h[:, 3:7] / np.linalg.norm(
             pred_h[:, 3:7], axis=-1, keepdims=True
         ).clip(1e-8)
@@ -77,10 +76,31 @@ def replay_episode(
         ang_err = _quat_angle_deg(pred_q, gt_q)  # [h]
         pos_errors.append(pos_err)
         quat_errors.append(ang_err)
+
+        if trace_fp is not None:
+            trace_fp.write(
+                json.dumps(
+                    {
+                        "frame": int(idx),
+                        "live_pos": state[idx, :3].tolist(),
+                        "live_quat_xyzw": state[idx, 3:7].tolist(),
+                        "live_joints": state[idx, 19:26].tolist(),
+                        "instruction": instruction,
+                        "image_paths": rel_paths,
+                        "pred_actions": pred_h.tolist(),
+                        "gt_actions": gt_h.tolist(),
+                        "pos_err_per_step": pos_err.tolist(),
+                        "ang_err_deg_per_step": ang_err.tolist(),
+                    }
+                )
+                + "\n"
+            )
+            trace_fp.flush()
+
         if n < 3 or n == len(sampled_idx) - 1:
             print(
-                f"  frame {idx:4d}: pred[0] pos={pred[0, :3].round(4).tolist()} "
-                f"gt[0] pos={action_gt[idx, :3].round(4).tolist()} "
+                f"  frame {idx:4d}: live_pos={state[idx, :3].round(4).tolist()} "
+                f"pred[0]={pred[0, :3].round(4).tolist()} gt[0]={action_gt[idx, :3].round(4).tolist()} "
                 f"|Δpos|={pos_err[0].sum():.4f}m  Δang={ang_err[0]:.2f}°"
             )
 
@@ -106,7 +126,12 @@ def main() -> None:
     p.add_argument("--sample-every", type=int, default=20, help="frame stride")
     p.add_argument("--horizon", type=int, default=10, help="actions per chunk to score")
     p.add_argument("--instruction", default=None)
-    p.add_argument("--out", default=None, help="optional JSON results path")
+    p.add_argument("--out", default=None, help="optional JSON summary path")
+    p.add_argument(
+        "--trace",
+        default=None,
+        help="optional JSONL path: full per-frame inputs/outputs",
+    )
     args = p.parse_args()
 
     with open(args.meta) as f:
@@ -115,21 +140,29 @@ def main() -> None:
     instruction = args.instruction or item.get("instruction", DEFAULT_INSTRUCTION)
 
     policy = AICXVLAPolicy(args.checkpoint)
-    results = replay_episode(
-        policy,
-        parquet_path=item["parquet_path"],
-        image_root=item["image_root"],
-        instruction=instruction,
-        sample_every=args.sample_every,
-        horizon=args.horizon,
-    )
+    trace_fp = open(args.trace, "w") if args.trace else None
+    try:
+        results = replay_episode(
+            policy,
+            parquet_path=item["parquet_path"],
+            image_root=item["image_root"],
+            instruction=instruction,
+            sample_every=args.sample_every,
+            horizon=args.horizon,
+            trace_fp=trace_fp,
+        )
+    finally:
+        if trace_fp:
+            trace_fp.close()
+            print(f"wrote trace to {args.trace}")
+
     print("\n=== Replay results ===")
     for k, v in results.items():
         print(f"  {k}: {v}")
     if args.out:
         with open(args.out, "w") as f:
             json.dump(results, f, indent=2)
-        print(f"\nwrote {args.out}")
+        print(f"wrote summary to {args.out}")
 
 
 if __name__ == "__main__":
