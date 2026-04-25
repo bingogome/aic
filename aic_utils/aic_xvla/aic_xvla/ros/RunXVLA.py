@@ -10,10 +10,20 @@ Run (after `aic_xvla.serve` is up and `/entrypoint.sh` started the engine):
         -p policy:=aic_xvla.ros.RunXVLA \\
         -p policy_config_file:=/path/to/runxvla.yaml   # optional
 
-Configuration via the policy_config_file (yaml) or env vars:
-    AIC_XVLA_SERVER_URL  default http://127.0.0.1:8010
-    AIC_XVLA_TIMEOUT_S   default 30.0
-    AIC_XVLA_REPLAN      default 1     (every N executed actions before requerying)
+Configuration via env vars:
+    AIC_XVLA_SERVER_URL        default http://127.0.0.1:8010
+    AIC_XVLA_TIMEOUT_S         default 30.0
+    AIC_XVLA_REPLAN            default 1     (every N executed actions before requerying)
+    AIC_XVLA_TASK_TIMEOUT_S    default 60.0
+    AIC_XVLA_CONTROL_PERIOD_S  default 0.25
+
+Debug aids (optional, off by default):
+    AIC_XVLA_DEBUG_IMAGE_DIR   if set, the first observed frame from each cam
+                               is written here as PNG so you can visually
+                               compare against the training JPEGs.
+    AIC_XVLA_BGR_INPUT=1       treat ROS image bytes as BGR instead of RGB
+                               (toggle to test the channel-order hypothesis
+                               without recompiling).
 """
 
 from __future__ import annotations
@@ -69,15 +79,14 @@ def _state_from_observation(obs: Observation) -> np.ndarray:
     )
 
 
-def _ros_image_to_b64(img_msg) -> str:
+def _ros_image_to_b64(img_msg, bgr_input: bool = False) -> str:
     arr = np.frombuffer(img_msg.data, dtype=np.uint8).reshape(
         img_msg.height, img_msg.width, 3
     )
-    ok, buf = cv2.imencode(
-        ".jpg",
-        cv2.cvtColor(arr, cv2.COLOR_RGB2BGR),
-        [int(cv2.IMWRITE_JPEG_QUALITY), 90],
-    )
+    # The data parquet's JPEGs are RGB-encoded. cv2 wants BGR for imencode,
+    # so convert from whatever the live source actually is.
+    bgr = arr if bgr_input else cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+    ok, buf = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
     if not ok:
         raise RuntimeError("cv2.imencode failed")
     return base64.b64encode(buf.tobytes()).decode("ascii")
@@ -93,9 +102,13 @@ class RunXVLA(Policy):
         self.control_period_s = float(
             os.environ.get("AIC_XVLA_CONTROL_PERIOD_S", "0.25")
         )
+        self.debug_image_dir = os.environ.get("AIC_XVLA_DEBUG_IMAGE_DIR", "") or None
+        self.bgr_input = os.environ.get("AIC_XVLA_BGR_INPUT", "0") == "1"
+        self._dumped_images = False
         self.get_logger().info(
             f"RunXVLA server={self.server_url} replan_every={self.replan_every} "
-            f"timeout_s={self.timeout_s} control_period_s={self.control_period_s}"
+            f"timeout_s={self.timeout_s} control_period_s={self.control_period_s} "
+            f"debug_image_dir={self.debug_image_dir} bgr_input={self.bgr_input}"
         )
         self._wait_for_server()
 
@@ -113,14 +126,41 @@ class RunXVLA(Policy):
             f"server at {self.server_url} not responding; continuing anyway"
         )
 
+    def _maybe_dump_first_frame(self, obs: Observation) -> None:
+        if not self.debug_image_dir or self._dumped_images:
+            return
+        try:
+            os.makedirs(self.debug_image_dir, exist_ok=True)
+            for cam, msg in [
+                ("left", obs.left_image),
+                ("center", obs.center_image),
+                ("right", obs.right_image),
+            ]:
+                arr = np.frombuffer(msg.data, dtype=np.uint8).reshape(
+                    msg.height, msg.width, 3
+                )
+                # Write two versions so you can tell at a glance which channel order is right.
+                cv2.imwrite(
+                    os.path.join(self.debug_image_dir, f"first_{cam}_assume_rgb.png"),
+                    cv2.cvtColor(arr, cv2.COLOR_RGB2BGR),
+                )
+                cv2.imwrite(
+                    os.path.join(self.debug_image_dir, f"first_{cam}_assume_bgr.png"),
+                    arr,
+                )
+            self._dumped_images = True
+            self.get_logger().info(f"dumped first frames to {self.debug_image_dir}")
+        except Exception as ex:
+            self.get_logger().warn(f"image dump failed: {ex}")
+
     def _request_actions(self, obs: Observation, instruction: str) -> np.ndarray:
         state = _state_from_observation(obs)
         payload = {
             "state": state.tolist(),
             "images": [
-                _ros_image_to_b64(obs.left_image),
-                _ros_image_to_b64(obs.center_image),
-                _ros_image_to_b64(obs.right_image),
+                _ros_image_to_b64(obs.left_image, self.bgr_input),
+                _ros_image_to_b64(obs.center_image, self.bgr_input),
+                _ros_image_to_b64(obs.right_image, self.bgr_input),
             ],
             "instruction": instruction,
             "steps": 10,
@@ -156,11 +196,13 @@ class RunXVLA(Policy):
     ) -> bool:
         self.get_logger().info(f"RunXVLA.insert_cable() enter. Task: {task}")
         instruction = getattr(task, "instruction", "") or DEFAULT_INSTRUCTION
+        self.get_logger().info(f"using instruction: {instruction!r}")
         send_feedback("RunXVLA: starting")
 
         start = time.time()
         chunk: np.ndarray | None = None
         chunk_idx = 0
+        step = 0
 
         while time.time() - start < self.task_timeout_s:
             loop_start = time.time()
@@ -169,15 +211,23 @@ class RunXVLA(Policy):
                 self.sleep_for(self.control_period_s)
                 continue
 
+            self._maybe_dump_first_frame(obs)
+            live_pos = (
+                obs.controller_state.tcp_pose.position.x,
+                obs.controller_state.tcp_pose.position.y,
+                obs.controller_state.tcp_pose.position.z,
+            )
+
             need_replan = chunk is None or chunk_idx >= min(
                 self.replan_every, chunk.shape[0]
             )
             if need_replan:
                 try:
+                    t_inf = time.time()
                     chunk = self._request_actions(obs, instruction)
                     chunk_idx = 0
                     self.get_logger().info(
-                        f"got action chunk shape={tuple(chunk.shape)}"
+                        f"chunk shape={tuple(chunk.shape)} inf_dt={time.time()-t_inf:.2f}s"
                     )
                 except Exception as ex:
                     self.get_logger().error(f"inference failed: {ex}")
@@ -188,7 +238,13 @@ class RunXVLA(Policy):
             action = chunk[chunk_idx]
             chunk_idx += 1
             self._send_pose(move_robot, action)
+            self.get_logger().info(
+                f"step={step} live_pos=[{live_pos[0]:+.4f},{live_pos[1]:+.4f},{live_pos[2]:+.4f}] "
+                f"target_pos=[{action[0]:+.4f},{action[1]:+.4f},{action[2]:+.4f}] "
+                f"Δz={action[2]-live_pos[2]:+.4f}"
+            )
             send_feedback(f"step pos={action[:3].round(3).tolist()}")
+            step += 1
 
             elapsed = time.time() - loop_start
             self.sleep_for(max(0.0, self.control_period_s - elapsed))
