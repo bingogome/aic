@@ -1,0 +1,12 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aic_xvla"
+version = "0.0.1"
+description = "End-to-end X-VLA fine-tune + eval on aic data"
+requires-python = ">=3.10"
+
+[tool.setuptools.packages.find]
+include = ["aic_xvla*"]
