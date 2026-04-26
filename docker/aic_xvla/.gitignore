@@ -1,0 +1,5 @@
+# Build-time artifacts produced by build_assets.sh.
+# These are baked into the image but too big / not source-of-truth to commit.
+hf_cache/
+aic_xvla_ckpt/
+X-VLA-src.tar
