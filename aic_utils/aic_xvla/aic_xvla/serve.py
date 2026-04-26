@@ -46,6 +46,7 @@ def build_app(policy: AICXVLAPolicy) -> FastAPI:
     log = logging.getLogger("aic_xvla.serve")
 
     @app.get("/healthz")
+    @app.get("/health")
     def healthz():
         return {"ok": True, "device": str(policy.device)}
 
