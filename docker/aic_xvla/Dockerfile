@@ -29,8 +29,11 @@ COPY pixi.toml pixi.lock /ws_aic/src/aic/
 COPY pixi_env_setup.sh /ws_aic/src/aic/
 
 SHELL ["/bin/bash", "-c"]
+# Match CI (.github/workflows/pixi.yml uses frozen=true). The committed
+# pixi.lock occasionally drifts from pixi.toml (transitive ros pkg metadata
+# changes); --frozen installs straight from the lockfile without re-checking.
 RUN --mount=type=cache,target=/root/.cache/rattler/cache --mount=type=cache,target=/ws_aic/src/aic/.pixi/build \
-    cd /ws_aic/src/aic && pixi install --locked
+    cd /ws_aic/src/aic && pixi install --frozen
 
 # --- conda XVLA env: torch + transformers + peft + fastapi + ... ---
 COPY docker/aic_xvla/xvla_requirements.txt /tmp/xvla_requirements.txt
