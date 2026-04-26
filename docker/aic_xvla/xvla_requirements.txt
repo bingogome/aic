@@ -21,3 +21,6 @@ mmengine==0.10.5
 av==15.0.0
 requests==2.33.1
 protobuf==7.34.1
+pyarrow==20.0.0
+h5py==3.12.1
+json_numpy==2.1.0
