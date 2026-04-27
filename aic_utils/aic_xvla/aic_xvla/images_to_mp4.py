@@ -44,7 +44,9 @@ def collect_frames(image_root: Path, min_step: int, max_step: int) -> list[int]:
         common = steps if common is None else (common & steps)
     sel = sorted(s for s in (common or set()) if min_step <= s <= max_step)
     if not sel:
-        raise SystemExit("no frames matched (check --min-step/--max-step and image-root).")
+        raise SystemExit(
+            "no frames matched (check --min-step/--max-step and image-root)."
+        )
     return sel
 
 
@@ -60,23 +62,37 @@ def tile(left: np.ndarray, center: np.ndarray, right: np.ndarray) -> np.ndarray:
 
 def annotate(im: np.ndarray, text: str) -> np.ndarray:
     out = im.copy()
-    cv2.putText(out, text, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                (0, 0, 0), 4, cv2.LINE_AA)
-    cv2.putText(out, text, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                (255, 255, 255), 1, cv2.LINE_AA)
+    cv2.putText(
+        out, text, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 4, cv2.LINE_AA
+    )
+    cv2.putText(
+        out,
+        text,
+        (10, 28),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        (255, 255, 255),
+        1,
+        cv2.LINE_AA,
+    )
     return out
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--image-root", required=True, type=Path,
-                    help="dir containing images/{left,center,right}/NNNNNN.jpg")
+    ap.add_argument(
+        "--image-root",
+        required=True,
+        type=Path,
+        help="dir containing images/{left,center,right}/NNNNNN.jpg",
+    )
     ap.add_argument("--out", required=True, type=Path)
     ap.add_argument("--fps", type=int, default=5)
     ap.add_argument("--min-step", type=int, default=0)
     ap.add_argument("--max-step", type=int, default=10**9)
-    ap.add_argument("--hold-frames", type=int, default=1,
-                    help="repeat each frame N times (slow-mo)")
+    ap.add_argument(
+        "--hold-frames", type=int, default=1, help="repeat each frame N times (slow-mo)"
+    )
     args = ap.parse_args()
 
     if shutil.which("ffmpeg") is None:
@@ -99,10 +115,18 @@ def main() -> None:
 
         args.out.parent.mkdir(parents=True, exist_ok=True)
         cmd = [
-            "ffmpeg", "-y", "-framerate", str(args.fps),
-            "-i", str(tmpdir / "%06d.png"),
-            "-c:v", "libx264", "-pix_fmt", "yuv420p",
-            "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+            "ffmpeg",
+            "-y",
+            "-framerate",
+            str(args.fps),
+            "-i",
+            str(tmpdir / "%06d.png"),
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-vf",
+            "scale=trunc(iw/2)*2:trunc(ih/2)*2",
             str(args.out),
         ]
         subprocess.run(cmd, check=True)
