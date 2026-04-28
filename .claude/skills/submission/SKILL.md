@@ -40,7 +40,19 @@ Submitting a policy to the AI for Industry Challenge: build a Docker image with 
 
 For credential/auth details and rotation policy, see memory file `~/.claude/projects/-home-yifeng-workspace-aic/memory/reference_aic_submission.md`.
 
-## Canonical 8-step workflow (X-VLA submission)
+## X-VLA image env vars (validated on submission1, 2026-04-26)
+
+Set in `docker/docker-compose.yaml` `model.environment` and/or the image's entrypoint. Match these on retries unless deliberately tuning:
+
+| var | value | why |
+| :--- | :--- | :--- |
+| `AIC_XVLA_TASK_TIMEOUT_S` | `180` | Matches submission1; plenty of margin for cold-GPU first-action latency at portal. Lower values risk timeout on the first trial before CUDA kernels are warm. |
+| `AIC_XVLA_REPLAN` | depends on ckpt encoding | **`absolute` ckpts** (e.g. submission1's overfit-1ep-3k-abs): `15` works (sub1 = 63.5 portal); world-anchored targets self-correct so open-loop drift doesn't compound. **`delta` ckpts** (e.g. ckpt-20000, earnest-morning-9): use `1`. Open-loop delta execution compounds errors — REPLAN=15 on delta ckpt-20000 scored 53 local vs 75 with REPLAN=1. **Always check `cat <ckpt>/aic_xvla_meta.json` to confirm encoding before picking REPLAN.** |
+| `HF_HUB_OFFLINE` | `1` | Portal blocks network — must resolve from baked HF cache. |
+| `TRANSFORMERS_OFFLINE` | `1` | Same as above. |
+| `AIC_ENABLE_ACL` | `true` | Portal always runs ACL on. Off only as one-shot diagnostic. |
+
+## Canonical 7-step workflow (X-VLA submission)
 
 Run from worktree root (currently `/home/yifeng/workspace/aic/.claude/worktree-xvla-submission`):
 
@@ -58,22 +70,27 @@ aws ecr describe-repositories --region us-east-1 --repository-names aic-team/cab
 #    layer changed. After apt-layer changes use `build --no-cache model`.
 docker compose -f docker/docker-compose.yaml build model 2>&1 | tee /tmp/build.log
 
-# 4. Local verify, ACL OFF (~12 min). Brings up BOTH containers (eval + model).
+# 4. Local verify with ACL ON (~12 min). Portal always runs ACL on, so this
+#    is the only gating run. Ensure `AIC_ENABLE_ACL: true` is UNCOMMENTED on
+#    BOTH eval and model services in compose (default state in this repo).
 #    Watch model logs for "X-VLA server ready", then eval logs for
-#    "All Trials Processed!" with Total Score within ±5 of 63.5.
-docker compose -f docker/docker-compose.yaml up
-cp ~/aic_results/scoring.yaml /home/yifeng/aic_xvla_overfit_abs/scoring_dockerized.yaml
+#    "All Trials Processed!" with Total Score within ±5 of dev-side baseline.
+#
+#    CRITICAL: `~/aic_results/scoring.yaml` lives INSIDE the eval container
+#    and dies on `down`. Tee stdout to a host logfile so the printed YAML
+#    block survives. The "Total Score:" line and the full YAML appear
+#    between "All Trials Processed!" and process shutdown.
+mkdir -p ~/aic_results_archive
+LOG=~/aic_results_archive/run_$(date +%Y%m%d_%H%M).log
+docker compose -f docker/docker-compose.yaml up 2>&1 | tee $LOG
 docker compose -f docker/docker-compose.yaml down
+grep "Total Score:" $LOG
 
-# 5. Local verify, ACL ON (~12 min). MOST IMPORTANT TEST — portal runs with ACL.
-#    Uncomment `AIC_ENABLE_ACL: true` on BOTH eval and model services in compose.
-#    Re-run, score should still be ~63. Revert compose after.
-
-# 6. (Optional) Test the AIC_MODEL_ROUTER_ADDR fallback path:
+# 5. (Optional) Test the AIC_MODEL_ROUTER_ADDR fallback path:
 #    edit compose model.environment to use AIC_MODEL_ROUTER_ADDR instead of
 #    AIC_ROUTER_ADDR; rerun to prove portal's env-var name path works.
 
-# 7. Push to ECR (~10 min upload). DO NOT proceed unless steps 4 and 5 PASSED.
+# 6. Push to ECR (~10 min upload). DO NOT proceed unless step 4 PASSED.
 aws ecr get-login-password --region us-east-1 \
     | docker login --username AWS --password-stdin 973918476471.dkr.ecr.us-east-1.amazonaws.com
 TAG="xvla-$(date +%Y%m%d)-1"
@@ -81,7 +98,7 @@ docker tag aic-xvla:v1 973918476471.dkr.ecr.us-east-1.amazonaws.com/aic-team/cab
 docker push 973918476471.dkr.ecr.us-east-1.amazonaws.com/aic-team/cableholder:$TAG
 echo "URI for portal: 973918476471.dkr.ecr.us-east-1.amazonaws.com/aic-team/cableholder:$TAG"
 
-# 8. Manual: portal → AI for Industry Challenge → Submit → Qualification phase
+# 7. Manual: portal → AI for Industry Challenge → Submit → Qualification phase
 #    → paste URI → Submit. Monitor on My Submissions page. ~5–15 min to Finished.
 ```
 
@@ -89,12 +106,13 @@ echo "URI for portal: 973918476471.dkr.ecr.us-east-1.amazonaws.com/aic-team/cabl
 
 Block on ALL of these:
 
-- [ ] `~/aic_results/scoring.yaml` total within ±5 of validated baseline (63.5 for X-VLA)
-- [ ] ACL-on local run also passed (step 5)
+- [ ] ACL-on local run total within ±5 of validated dev-side baseline (extracted from teed log, NOT from `~/aic_results/scoring.yaml` which is stale-prone — see failure modes)
 - [ ] `docker/aic_xvla/{hf_cache,aic_xvla_ckpt,X-VLA-src.tar}` exist (step 1 ran)
 - [ ] `aws sts get-caller-identity` returns CableHolder identity (step 2 ran)
 - [ ] `docker image inspect aic-xvla:v1 --format '{{.Size}}'` size noted (no documented portal limit; X-VLA image is ~22 GB and was accepted)
 - [ ] No secrets baked into image (`docker run --rm aic-xvla:v1 env | grep -i aws` is empty)
+- [ ] **`AIC_XVLA_TASK_TIMEOUT_S` is `180` in the baked entrypoint** (NOT a lower default). Verify with: `docker run --rm --entrypoint cat aic-xvla:v1 /entrypoint.sh | grep AIC_XVLA_TASK_TIMEOUT_S` — must show `180`. Lower values cause first-trial timeouts at portal before CUDA kernels warm up. **ALWAYS remind the user to run this check before push.**
+- [ ] **`AIC_XVLA_REPLAN` is `15` in the baked entrypoint** (NOT `1`). Verify with: `docker run --rm --entrypoint cat aic-xvla:v1 /entrypoint.sh | grep AIC_XVLA_REPLAN` — must show `15`. `replan=1` re-queries the policy every controller step and discards the trained action chunk → near-zero arm motion at portal (submission2 with replan=1 scored 21 vs submission1's 63.5 with replan=15). **ALWAYS remind the user to run this check before push.**
 
 ## Known failure modes (2026-04-26 debugging session)
 
@@ -110,13 +128,17 @@ If you see these errors during build or `up`, here is what they mean:
 | Dockerfile changes don't take effect (apt layer caches stale) | BuildKit cached the apt layer despite Dockerfile edit | `docker compose build --no-cache model` (forces full rebuild ~30 min) |
 | `eval` container logs `No node with name 'aic_model' found. Retrying...` indefinitely | `model` container's entrypoint crashed before the ROS node started | Check `docker compose logs model` for the actual stack trace; common causes are the ones above. |
 | Build context error `aic_xvla_ckpt: not found` or `X-VLA-src.tar: not found` | Forgot to run `build_assets.sh` first | Run `./docker/aic_xvla/build_assets.sh`; assets land in `docker/aic_xvla/` (gitignored). |
+| Pre-push checklist score reads ~94 but the ACL-on run you just watched printed Total Score: 30 | `~/aic_results/scoring.yaml` is written INSIDE the eval container (no host volume mount in default compose). After `docker compose down`, only host-side stdout survives. If you `cp ~/aic_results/scoring.yaml ...` on the host, you copy whatever earlier non-dockerized run wrote there — likely stale. | Always tee `docker compose up` to a logfile (step 4). Read score from `grep "Total Score:" $LOG`, NEVER from `~/aic_results/scoring.yaml` unless you've added a volume mount to compose. |
+| ACL-on local run scores far below dev-side baseline | Could be (a) auth wiring breaks observation/action plumbing, or (b) image/policy itself is broken regardless of auth. Need to bisect. | One-shot diagnostic: comment `AIC_ENABLE_ACL: true` on BOTH services in compose, re-run. If ACL-off ≈ ACL-on → auth is innocent, debug image/policy (timeouts? cold-GPU first-action latency? entrypoint env vars matching dev recipe?). If ACL-off ≫ ACL-on → check `AIC_MODEL_PASSWD` matches on both services and `ZENOH_CONFIG_OVERRIDE` has the `transport/auth/usrpwd/*` block on the model side. **Re-enable ACL before any further gate run.** |
 
 ## DO NOT
 
 - DO NOT push to ECR if local score isn't within ±5 of baseline.
 - DO NOT modify `pixi.lock` by hand. Pixi resolver only.
 - DO NOT bake AWS credentials into the image. Image runs at portal — secrets would be exfiltrated.
-- DO NOT skip the ACL-on local test (step 5). Portal runs with ACL; if it fails locally with ACL, it WILL fail at portal.
+- DO NOT skip the ACL-on local test (step 4). Portal runs with ACL; if it fails locally with ACL, it WILL fail at portal.
+- DO NOT keep ACL off "for convenience". ACL on is the default and the only state that gates submission. Flip it off only as a one-shot diagnostic when an ACL-on run scores poorly, and re-enable immediately after.
+- DO NOT trust `~/aic_results/scoring.yaml` after a `docker compose up` — it's stale (eval container's scoring file is not host-mounted). Read scores from a teed log instead.
 - DO NOT use the same ECR tag twice (immutable). Bump the suffix.
 - DO NOT push to upstream `intrinsic-dev/aic`. We push to `sl628/aic` only.
 - DO NOT post the AWS Secret Access Key in chat or commit it to any file. It lives only in `~/.aws/credentials`.
@@ -133,6 +155,7 @@ Trigger phrases that should make you load this skill:
 - "how do I run the eval locally"
 
 When applied, default to:
-1. Confirming where the user is in the 8-step workflow.
+1. Confirming where the user is in the 7-step workflow.
 2. Surfacing the relevant failure-mode row from the table if they pasted an error.
-3. Reminding about the daily limit + ACL local test before any `docker push`.
+3. Reminding about the daily limit + the ACL-on local test before any `docker push`.
+4. **ALWAYS reminding the user to verify `AIC_XVLA_TASK_TIMEOUT_S=180` is baked into the image** before any push: `docker run --rm --entrypoint cat aic-xvla:v1 /entrypoint.sh | grep AIC_XVLA_TASK_TIMEOUT_S` — output must show `180`. A lower value will cause first-trial timeouts on the portal's cold GPU.
