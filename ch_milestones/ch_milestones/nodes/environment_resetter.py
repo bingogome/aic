@@ -21,6 +21,7 @@ class EnvironmentResetterNode(Node):
         declare_task_parameters(self)
         declare_scene_parameters(self)
         declare_randomization_parameters(self)
+        self.declare_parameter("selected_task_index", -1)
         self.callback_group = ReentrantCallbackGroup()
         self.resetter = EnvironmentResetter(self, self.callback_group)
         self.create_service(

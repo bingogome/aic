@@ -49,6 +49,8 @@ IMAGE_FIELDS = {
     "right_camera": "right_image",
 }
 
+TASK_MESSAGE_FEATURE = "task.message_json"
+
 
 def features(image_shape, use_videos=True):
     dtype = "video" if use_videos else "image"
@@ -70,6 +72,11 @@ def features(image_shape, use_videos=True):
             "dtype": "float32",
             "shape": (len(ACTION_NAMES),),
             "names": ACTION_NAMES,
+        },
+        TASK_MESSAGE_FEATURE: {
+            "dtype": "string",
+            "shape": (1,),
+            "names": None,
         },
         **image_features,
     }

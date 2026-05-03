@@ -1,3 +1,4 @@
+import random
 import sys
 import threading
 import time
@@ -49,7 +50,11 @@ class MilestoneDataProducer(Node):
         self.declare_parameter("trim_on_insertion_event", True)
         self.declare_parameter("post_insertion_frames", 10)
         self.declare_parameter("require_insertion_event", True)
+        self.declare_parameter("randomize_target", True)
+        self.declare_parameter("random_seed", -1)
         declare_task_parameters(self)
+        seed = self.get_parameter("random_seed").value
+        self.target_rng = random.Random(None if seed < 0 else seed)
         self.change_state = self.create_client(ChangeState, "/aic_model/change_state")
         self.insert_cable = ActionClient(self, InsertCable, "/insert_cable")
         self.resetter = ResetClient(self)
@@ -60,8 +65,10 @@ class MilestoneDataProducer(Node):
         episode_count = self.get_parameter("episode_count").value
         retry_failed = self.get_parameter("retry_failed_episodes").value
         max_attempts = self.get_parameter("max_episode_attempts").value
+        randomize_target = self.get_parameter("randomize_target").value
         self.get_logger().info(
-            f"Task target sequence contains {task_sequence_size(self)} target(s)"
+            f"Task target pool contains {task_sequence_size(self)} target(s); "
+            f"randomize_target={randomize_target}"
         )
         completed = 0
         attempt = 0
@@ -100,6 +107,8 @@ class MilestoneDataProducer(Node):
         self.transition(Transition.TRANSITION_UNCONFIGURED_SHUTDOWN)
 
     def next_task_index(self):
+        if self.get_parameter("randomize_target").value:
+            return self.target_rng.randrange(task_sequence_size(self))
         task_index = self.task_index
         self.task_index += 1
         return task_index
@@ -116,7 +125,8 @@ class MilestoneDataProducer(Node):
         try:
             if force_reset or self.get_parameter("reset_before_episode").value:
                 self.resetter.reset(
-                    self.get_parameter("reset_service_timeout_seconds").value
+                    self.get_parameter("reset_service_timeout_seconds").value,
+                    task_index,
                 )
             self.transition(Transition.TRANSITION_CONFIGURE)
             configured = True

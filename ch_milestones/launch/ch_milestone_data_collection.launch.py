@@ -151,6 +151,8 @@ def generate_launch_description():
                 "trim_on_insertion_event": typed("trim_on_insertion_event", bool),
                 "post_insertion_frames": typed("post_insertion_frames", int),
                 "require_insertion_event": typed("require_insertion_event", bool),
+                "randomize_target": typed("randomize_target", bool),
+                "random_seed": typed("random_seed", int),
                 **task_parameters(),
             }
         ],
@@ -209,6 +211,7 @@ def generate_launch_description():
             argument("trim_on_insertion_event", "true"),
             argument("post_insertion_frames", 10),
             argument("require_insertion_event", "true"),
+            argument("randomize_target", "true"),
             argument("reset_timeout_seconds", 30.0),
             argument("task_id", "task_1"),
             argument("task_cable_type", "sfp_sc"),

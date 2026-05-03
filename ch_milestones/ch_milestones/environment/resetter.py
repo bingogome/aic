@@ -1,6 +1,7 @@
 import time
 from pathlib import Path
 
+from rclpy.parameter import Parameter
 from rclpy.time import Time
 from tf2_ros import Buffer, TransformListener
 
@@ -29,7 +30,7 @@ class EnvironmentResetter:
 
     def reset(self):
         timeout = self.node.get_parameter("reset_timeout_seconds").value
-        task = task_from_parameters(self.node, self.next_task_index())
+        task = task_from_parameters(self.node, self.task_index_for_reset())
         scene = self.randomizer.sample(task)
         self.log_scene(scene)
         self.delete_spawned(timeout)
@@ -51,6 +52,13 @@ class EnvironmentResetter:
         task_index = self.task_index
         self.task_index += 1
         return task_index
+
+    def task_index_for_reset(self):
+        task_index = self.node.get_parameter("selected_task_index").value
+        if task_index >= 0:
+            self.node.set_parameters([Parameter("selected_task_index", value=-1)])
+            return task_index
+        return self.next_task_index()
 
     def delete_spawned(self, timeout):
         for name in reversed(self.spawned):

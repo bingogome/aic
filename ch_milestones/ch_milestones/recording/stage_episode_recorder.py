@@ -14,9 +14,13 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy
 from std_msgs.msg import String
 
 from ch_milestones.config.policy_config import STAGES
-from ch_milestones.config.task_config import task_prompt
+from ch_milestones.config.task_config import task_message_json, task_prompt
 from ch_milestones.recording.episode_trim import InsertionEventTrim
-from ch_milestones.recording.lerobot_format import features, frame_from_ros
+from ch_milestones.recording.lerobot_format import (
+    TASK_MESSAGE_FEATURE,
+    features,
+    frame_from_ros,
+)
 
 
 class StageEpisodeRecorder:
@@ -58,6 +62,7 @@ class StageEpisodeRecorder:
         self.datasets = {}
         self.current_stage = None
         self.base_task_prompt = ""
+        self.task_message = ""
         self.observation = None
         self.action = None
         self.subscriptions = []
@@ -67,6 +72,7 @@ class StageEpisodeRecorder:
 
     def start(self, task):
         self.base_task_prompt = self.task_prompt_override or task_prompt(task)
+        self.task_message = task_message_json(task)
         self.node.get_logger().info(f"Recording task prompt: {self.base_task_prompt}")
         datasets = {}
         try:
@@ -187,6 +193,7 @@ class StageEpisodeRecorder:
             dataset = self.datasets[self.current_stage]
             frame = frame_from_ros(self.observation, self.action, self.image_shape)
             frame["task"] = self.stage_prompt(self.current_stage)
+            frame[TASK_MESSAGE_FEATURE] = self.task_message
             dataset.add_frame(frame)
 
     def on_insertion_event(self, msg):

@@ -1,3 +1,5 @@
+import json
+
 from aic_task_interfaces.msg import Task
 
 from ch_milestones.config.task_options import (
@@ -20,6 +22,18 @@ TASK_FIELDS = [
     ("port_name", ALL_VALUE),
     ("target_module_name", ALL_VALUE),
 ]
+
+TASK_MESSAGE_FIELDS = (
+    "id",
+    "cable_type",
+    "cable_name",
+    "plug_type",
+    "plug_name",
+    "port_type",
+    "port_name",
+    "target_module_name",
+    "time_limit",
+)
 
 
 def declare_task_parameters(node):
@@ -82,6 +96,14 @@ def validate_task(task: Task) -> None:
             "target_module_name": task.target_module_name,
         }
     )
+
+
+def task_message_dict(task: Task) -> dict:
+    return {field: getattr(task, field) for field in TASK_MESSAGE_FIELDS}
+
+
+def task_message_json(task: Task) -> str:
+    return json.dumps(task_message_dict(task), sort_keys=True, separators=(",", ":"))
 
 
 def task_prompt(task: Task) -> str:

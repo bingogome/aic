@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 from ch_milestones.config.scene_config import (
@@ -11,6 +13,7 @@ from ch_milestones.config.scene_config import (
 from ch_milestones.config.task_config import (
     TASK_FIELDS,
     task_from_parameters,
+    task_message_json,
     task_sequence_size,
 )
 from ch_milestones.config.task_options import (
@@ -88,6 +91,26 @@ def test_sc_target_resolves_to_reversed_cable_and_sc_pose():
         tuple(CABLE_DEFAULTS[field] for field in CABLE_POSE_FIELDS),
         auto_cable_pose=True,
     ) == (0.172, 0.024, 1.508, 0.4432, -0.48, 1.3303)
+
+
+def test_task_message_json_preserves_task_fields():
+    task = task_from_parameters(
+        task_node(target_module_name="sc_port_1", port_name="sc_port_base")
+    )
+
+    message = json.loads(task_message_json(task))
+
+    assert message == {
+        "id": "task_1",
+        "cable_type": "sfp_sc",
+        "cable_name": "cable_0",
+        "plug_type": "sc",
+        "plug_name": "sc_tip",
+        "port_type": "sc",
+        "port_name": "sc_port_base",
+        "target_module_name": "sc_port_1",
+        "time_limit": 180,
+    }
 
 
 def test_target_board_part_is_enabled_for_selected_mount():

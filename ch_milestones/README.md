@@ -79,6 +79,8 @@ Each frame contains:
 - **`observation.state`** (25D): TCP pose (7), TCP velocity (6), TCP error (6), joint positions (7)
 - **`action`** (7D): target TCP pose (position + quaternion)
 - **`observation.images.{left,center,right}_camera`**: RGB images (downscaled by `image_scale`)
+- **`task`**: natural-language LeRobot prompt, including the current oracle stage
+- **`task.message_json`**: serialized AIC `Task` message with plug, port, target module, and time limit fields
 
 Datasets support video encoding (`use_videos:=true`, default) or raw images, and can be resumed across runs.
 
@@ -130,8 +132,9 @@ Randomization uses a configurable distribution (`normal` or `uniform`) controlle
 | Argument | Default | Description |
 |----------|---------|-------------|
 | `port_type` | `auto` | Target port type. `auto` allows both SFP and SC targets |
-| `target_module_name` | `all` | Component that owns the target port. `all` cycles every compatible component |
-| `port_name` | `all` | Target port on the component. `all` cycles every compatible port |
+| `target_module_name` | `all` | Component that owns the target port. `all` allows every compatible component |
+| `port_name` | `all` | Target port on the component. `all` allows every compatible port |
+| `randomize_target` | `true` | Randomly sample from the compatible target set each episode. Set `false` for deterministic cycling |
 | `plug_type` | `auto` | Plug type. `auto` selects `sfp` for SFP ports and `sc` for SC ports |
 | `plug_name` | `auto` | Plug link prefix. `auto` selects `sfp_tip` or `sc_tip` |
 | `cable_type` | `auto` | Cable model. `auto` selects `sfp_sc_cable` or `sfp_sc_cable_reversed` |
@@ -154,18 +157,22 @@ Supported fixed-target combinations:
 | `sc_port_0` | `sc_port_base` | `sc` | `sc` / `sc_tip` | `sfp_sc_cable_reversed` |
 | `sc_port_1` | `sc_port_base` | `sc` | `sc` / `sc_tip` | `sfp_sc_cable_reversed` |
 
-With the defaults, episodes cycle through the full supported target list. The resetter automatically marks the selected target component as present before spawning the board. For example:
+With the defaults, each episode randomly samples from the full supported target set. The resetter automatically marks the selected target component as present before spawning the board, while other target-capable parts are still sampled randomly as distractors. Set `random_seed` to a positive value to make both target sampling and scene randomization reproducible. For example:
 
 ```bash
-# Full target sweep across all SFP and SC targets.
+# Random target sampling across all SFP and SC targets.
 pixi run ros2 launch ch_milestones ch_milestone_data_collection.launch.py \
   episode_count:=500 \
   sfp_oracle_debug_pause_motion:=false \
   sc_oracle_debug_pause_motion:=false
 
-# All SFP targets only.
+# Random sampling among SFP targets only.
 pixi run ros2 launch ch_milestones ch_milestone_data_collection.launch.py \
   port_type:=sfp
+
+# Deterministic cycle across all compatible targets.
+pixi run ros2 launch ch_milestones ch_milestone_data_collection.launch.py \
+  randomize_target:=false
 
 # SFP port on the fifth NIC mount.
 pixi run ros2 launch ch_milestones ch_milestone_data_collection.launch.py \
